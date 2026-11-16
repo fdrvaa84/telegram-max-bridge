@@ -1,0 +1,11 @@
+.*
+!.gitignore
+!.github/
+__pycache__/
+*.pyc
+.venv/
+*.session*
+*.sqlite*
+config.json
+state/
+*.part
