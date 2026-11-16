@@ -16,7 +16,7 @@ import sys
 import time
 from urllib.parse import urlsplit
 from aiohttp import ClientSession, ClientTimeout, TCPConnector, web
-from bridge import atomic, load_config, Bridge, PublicResolver
+from bridge import atomic, load_config, Bridge, PublicResolver, ssl_context
 
 DEFAULT = '/var/lib/telemax/config.json'
 
@@ -114,7 +114,7 @@ class Pairing:
 
 async def remote_command(path, command):
     config = load_config(path)
-    async with ClientSession(timeout=ClientTimeout(total=30), connector=TCPConnector(resolver=PublicResolver())) as http:
+    async with ClientSession(timeout=ClientTimeout(total=30), connector=TCPConnector(ssl=ssl_context(), resolver=PublicResolver())) as http:
         b = Bridge(config, None)
         b.http = http
         me = await b.api('GET', '/me')

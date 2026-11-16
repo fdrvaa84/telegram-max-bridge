@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -19,6 +20,38 @@ from cloud_copies import copy_pass, upload_verified
 
 
 class SetupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_management_commands_use_shared_verified_context(self):
+        for command in ['pair', 'subscribe', 'unsubscribe']:
+            context = bridge.ssl_context()
+            with patch.object(manage, 'load_config', return_value={}), \
+                 patch.object(manage, 'ssl_context', return_value=context) as factory, \
+                 patch.object(manage.Bridge, 'api', AsyncMock(side_effect=RuntimeError('stop before setup'))):
+                original = manage.TCPConnector
+                with patch.object(manage, 'TCPConnector', wraps=original) as connector:
+                    with self.assertRaisesRegex(RuntimeError, 'stop before setup'):
+                        await manage.remote_command('unused', command)
+                    self.assertIs(connector.call_args.kwargs['ssl'], context)
+                    factory.assert_called_once_with()
+
+    async def test_https_check_uses_the_same_verified_session_as_max(self):
+        context = bridge.ssl_context()
+        sessions = []
+        async def api(instance, *args):
+            sessions.append(instance.http)
+            return {'user_id': 456}
+        async def check(config, http):
+            self.assertIs(http, sessions[0])
+            self.assertIs(http.connector._ssl, context)
+        with patch.object(manage, 'load_config', return_value={}), \
+             patch.object(manage, 'ssl_context', return_value=context), \
+             patch.object(manage.Bridge, 'api', api), \
+             patch.object(manage, 'wait_local_ready', AsyncMock()), \
+             patch.object(manage, 'check_https', AsyncMock(side_effect=check)) as https, \
+             patch.object(manage, 'subscribe', AsyncMock()), \
+             patch.object(manage, 'save'):
+            await manage.remote_command('unused', 'subscribe')
+            https.assert_awaited_once()
+
     async def test_pairing_requires_secret_nonce_and_private_owner_confirmation(self):
         config = {'webhook_secret': 'synthetic-secret', 'max_bot_id': 456}
         pair = manage.Pairing(config, 'synthetic-nonce')
@@ -155,9 +188,13 @@ class SetupTests(unittest.IsolatedAsyncioTestCase):
                 'state_dir':root+'/state','webhook_secret':'synthetic','local_token':'synthetic','port':port}).encode())
             code='''import asyncio,sys
 from argparse import Namespace
-from unittest.mock import AsyncMock
 import bridge
-bridge.Bridge.api=AsyncMock(return_value={'user_id':456})
+context=bridge.ssl_context()
+bridge.ssl_context=lambda: context
+async def api(self,*args,**kwargs):
+    assert self.http.connector._ssl is context
+    return {'user_id':456}
+bridge.Bridge.api=api
 asyncio.run(bridge.main(Namespace(config=sys.argv[1],check=False,login=False,enable=False)))
 '''
             proc=await asyncio.create_subprocess_exec(sys.executable,'-c',code,str(config),
@@ -183,6 +220,19 @@ asyncio.run(bridge.main(Namespace(config=sys.argv[1],check=False,login=False,ena
 
 
 class LocalSetupTests(unittest.TestCase):
+    def test_local_trust_preserves_system_roots_and_verification(self):
+        standard = ssl.create_default_context()
+        context = bridge.ssl_context()
+        self.assertTrue(context.check_hostname)
+        self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+        self.assertTrue(set(standard.get_ca_certs(binary_form=True)) <= set(context.get_ca_certs(binary_form=True)))
+        pem = Path(bridge.__file__).with_name('russian_trusted_root_ca.pem').read_text()
+        der = ssl.PEM_cert_to_DER_cert(pem)
+        self.assertIn(der, context.get_ca_certs(binary_form=True))
+        with patch.object(bridge.Path, 'read_text', return_value=ssl.DER_cert_to_PEM_cert(standard.get_ca_certs(binary_form=True)[0])):
+            with self.assertRaisesRegex(ValueError, 'fingerprint_mismatch'):
+                bridge.ssl_context()
+
     def test_configure_hidden_secrets_permissions_and_reentry_refusal(self):
         with tempfile.TemporaryDirectory() as root:
             path=Path(root)/'config.json'

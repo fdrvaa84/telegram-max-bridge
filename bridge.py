@@ -29,6 +29,21 @@ from telethon import TelegramClient, errors, functions, types, utils
 MAX_BYTES = 250 * 1024 * 1024
 
 
+def ssl_context():
+    """Keep system roots and add the pinned public MAX trust root locally.
+
+    Source: https://gu-st.ru/content/lending/russian_trusted_root_ca_pem.crt
+    Authority: https://www.gosuslugi.ru/crt
+    """
+    pem = Path(__file__).with_name('russian_trusted_root_ca.pem').read_text(encoding='ascii')
+    fingerprint = hashlib.sha256(ssl.PEM_cert_to_DER_cert(pem)).hexdigest()
+    if fingerprint != 'd26d2d0231b7c39f92cc738512ba54103519e4405d68b5bd703e9788ca8ecf31':
+        raise ValueError('max_trust_root_fingerprint_mismatch')
+    context = ssl.create_default_context()
+    context.load_verify_locations(cadata=pem)
+    return context
+
+
 def atomic(path, data):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -880,7 +895,7 @@ async def main(args):
         if me.bot or me.id != c.get('telegram_owner_id'):
             raise ValueError('telegram_identity_mismatch')
     b = Bridge(c, s, client)
-    tls = ssl.create_default_context()
+    tls = ssl_context()
     from aiohttp import TCPConnector
     async with ClientSession(timeout=ClientTimeout(total=240), connector=TCPConnector(ssl=tls, resolver=PublicResolver())) as http:
         b.http = http

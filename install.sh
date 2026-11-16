@@ -16,6 +16,10 @@ src=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 if [[ $mode == install && -e /opt/telemax/current ]]; then
     echo 'Уже установлено. Используйте sudo telemax update.'; exit 1
 fi
+was_active=false
+if [[ $mode == --update ]] && systemctl is-active --quiet telemax; then
+    was_active=true
+fi
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq python3 python3-venv ffmpeg ca-certificates curl git iproute2
@@ -27,7 +31,7 @@ chmod 755 "$release"
 trap 'if [[ -n ${release:-} ]]; then rm -rf -- "$release"; fi' EXIT
 install -d -m 755 "$release/app"
 # Explicit allowlist: never package the caller's configuration or session files.
-for name in bridge.py cloud_copies.py manage.py test_bridge.py test_setup.py requirements.txt telemax install.sh README.md GUIDE_RU.md SECURITY.md; do
+for name in bridge.py russian_trusted_root_ca.pem cloud_copies.py manage.py test_bridge.py test_setup.py requirements.txt telemax install.sh README.md GUIDE_RU.md SECURITY.md; do
     install -m 644 "$src/$name" "$release/app/$name"
 done
 chmod 755 "$release/app/telemax" "$release/app/install.sh"
@@ -73,12 +77,13 @@ WantedBy=multi-user.target
 UNIT
 if [[ $mode != --prepare-only ]]; then
     systemctl daemon-reload
-    if [[ $mode == --update ]]; then
-        systemctl restart telemax
+    if [[ $mode == --update && $was_active == true ]]; then
+        restart_ok=true
+        systemctl restart telemax || restart_ok=false
         sleep 3
-        if ! systemctl is-active --quiet telemax; then
+        if [[ $restart_ok != true ]] || ! systemctl is-active --quiet telemax; then
             echo 'Новая версия не запустилась. Возвращаем прежнюю программу.'
-            /usr/local/bin/telemax rollback
+            /usr/local/bin/telemax rollback --restore-active
             exit 1
         fi
     fi

@@ -135,11 +135,15 @@ update)
     ;;
 rollback)
     [[ -L /opt/telemax/previous ]] || { echo 'Предыдущая программа не сохранена.'; exit 1; }
+    was_active=false
+    if systemctl is-active --quiet telemax; then was_active=true; fi
+    # The installer restores a previously running service even if the new one failed.
+    if [[ ${1:-} == --restore-active ]]; then was_active=true; fi
     systemctl stop telemax
     ln -s "$(readlink /opt/telemax/previous)" /opt/telemax/current.rollback
     mv -Tf /opt/telemax/current.rollback /opt/telemax/current
     install -m 755 /opt/telemax/current/app/telemax /usr/local/bin/telemax
-    systemctl start telemax
+    if [[ $was_active == true ]]; then systemctl start telemax; fi
     echo 'Прежняя программа возвращена. Вход, очередь и связь сообщений сохранены.'
     ;;
 help|*) echo 'Команды: configure, https, pair, login, start, status, logs, restart, subscribe, update, rollback, stop, clouds, https-update.' ;;
