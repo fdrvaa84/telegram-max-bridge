@@ -151,6 +151,8 @@ async def remote_command(path, command):
             finally:
                 await runner.cleanup()
         elif command == 'subscribe':
+            # systemd start returns before Telegram and the local receiver are ready.
+            await wait_local_ready(config)
             await check_https(config, http)
             await subscribe(b)
             save(path, config)
@@ -160,6 +162,20 @@ async def remote_command(path, command):
             from urllib.parse import urlencode
             await b.api('DELETE', '/subscriptions?' + urlencode({'url': url}))
             print('Приём от MAX отключён. Вход Telegram остаётся сохранённым.')
+
+
+async def wait_local_ready(config):
+    # Local readiness is not a proof of public reachability; HTTPS is checked next.
+    async with ClientSession(timeout=ClientTimeout(total=1)) as local:
+        for attempt in range(45):
+            try:
+                async with local.get('http://127.0.0.1:' + str(config['port']) + '/health') as response:
+                    if response.status == 200 and (await response.json()).get('ready') is True:
+                        return
+            except Exception:
+                pass
+            await asyncio.sleep(1)
+    raise SetupError('Передача пока не запустилась. Проверьте состояние и безопасный журнал.')
 
 
 async def check_https(config, http):

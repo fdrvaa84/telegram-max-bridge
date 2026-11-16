@@ -64,6 +64,18 @@ class SetupTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError): await manage.subscribe(b)
         b.api.assert_awaited_once()
 
+    async def test_subscribe_waits_for_receiver_readiness(self):
+        calls=0
+        async def health(request):
+            nonlocal calls
+            calls+=1
+            return web.json_response({'ready': calls>=2},status=200 if calls>=2 else 503)
+        app=web.Application();app.router.add_get('/health',health)
+        async with TestServer(app) as server:
+            with patch.object(manage.asyncio,'sleep',AsyncMock()):
+                await manage.wait_local_ready({'port':server.port})
+        self.assertEqual(calls,2)
+
     async def test_two_clouds_independent_and_durable_after_restart(self):
         with tempfile.TemporaryDirectory() as root:
             store = bridge.Store(root)
