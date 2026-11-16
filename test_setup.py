@@ -235,6 +235,26 @@ class LocalSetupTests(unittest.TestCase):
         for value in ['https://example.org','example.org;id','example.org\n{','127.0.0.1','example.org:443','x..org','-x.org','x.org/path']:
             with self.subTest(value=value), self.assertRaises(ValueError): manage.domain_name(value)
 
+    def test_cloud_upload_confirms_actual_bytes_not_only_metadata(self):
+        import io
+        from types import SimpleNamespace as NS
+        objects={}
+        corrupt=False
+        def put(**kwargs): objects[kwargs['Key']]=kwargs['Body']
+        def get(**kwargs):
+            data=objects[kwargs['Key']]
+            if corrupt and not kwargs['Key'].endswith('.json'): data=b'corrupted'
+            return {'Body':io.BytesIO(data)}
+        with tempfile.TemporaryDirectory() as root:
+            path=Path(root)/'original';path.write_bytes(b'original')
+            meta={'sha256':hashlib.sha256(b'original').hexdigest(),'size':8,'name':'synthetic.pdf'}
+            target={'endpoint':'https://one.example.org','bucket':'synthetic','access_key':'synthetic','secret_key':'synthetic'}
+            with patch('boto3.client',return_value=NS(put_object=put,get_object=get)):
+                upload_verified(target,'test',path,meta)
+                self.assertEqual(json.loads(objects['test.json']),meta)
+                corrupt=True
+                with self.assertRaises(ValueError): upload_verified(target,'test',path,meta)
+
     def test_installer_shell_syntax_and_no_private_paths(self):
         for name in ['install.sh','telemax']:
             self.assertEqual(subprocess.run(['bash','-n',name]).returncode,0)

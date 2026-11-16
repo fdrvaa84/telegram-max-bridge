@@ -113,11 +113,25 @@ UNIT
     systemctl enable --now telemax-web
     echo 'Получение сертификата запущено. Подождите минуту, затем sudo telemax pair.'
     ;;
+https-update)
+    [[ -f /etc/systemd/system/telemax-web.service ]] || { echo 'Сначала настройте защищённый адрес.'; exit 1; }
+    temp=$(mktemp -d)
+    trap 'rm -rf -- "$temp"' EXIT
+    apt-get update -qq
+    (cd "$temp" && apt-get download caddy >/dev/null)
+    dpkg-deb -x "$temp"/caddy_*.deb "$temp/extracted"
+    "$temp/extracted/usr/bin/caddy" validate --config /etc/telemax/Caddyfile --adapter caddyfile >/dev/null
+    install -m 755 "$temp/extracted/usr/bin/caddy" /opt/telemax/web/usr/bin/caddy.next
+    mv -Tf /opt/telemax/web/usr/bin/caddy.next /opt/telemax/web/usr/bin/caddy
+    systemctl restart telemax-web
+    echo 'Защищённый приём обновлён. Проверьте живой ответ MAX.'
+    ;;
 update)
     temp=$(mktemp -d)
     trap 'rm -rf -- "$temp"' EXIT
     git clone --quiet --depth 1 --branch main https://github.com/fdrvaa84/telegram-max-bridge.git "$temp/source"
     bash "$temp/source/install.sh" --update
+    if [[ -f /etc/systemd/system/telemax-web.service ]]; then /usr/local/bin/telemax https-update; fi
     ;;
 rollback)
     [[ -L /opt/telemax/previous ]] || { echo 'Предыдущая программа не сохранена.'; exit 1; }
@@ -128,5 +142,5 @@ rollback)
     systemctl start telemax
     echo 'Прежняя программа возвращена. Вход, очередь и связь сообщений сохранены.'
     ;;
-help|*) echo 'Команды: configure, https, pair, login, start, status, logs, restart, subscribe, update, rollback, stop, clouds.' ;;
+help|*) echo 'Команды: configure, https, pair, login, start, status, logs, restart, subscribe, update, rollback, stop, clouds, https-update.' ;;
 esac
