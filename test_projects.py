@@ -45,6 +45,57 @@ class ProjectTests(unittest.TestCase):
                 self.assertNotEqual(one, two)
                 self.assertEqual(project.allocate('one'), one)
 
+    def test_new_https_receiver_retry_and_stopped_receiver(self):
+        for failure, prior_route in (('validate', None), ('enable', 'previous route\n')):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                def path(value):
+                    if str(value).startswith('/tmp/'):
+                        return Path(value)
+                    return root / str(value).lstrip('/')
+                active = False
+                failed = False
+                def run(args, **kwargs):
+                    if args[:2] == ['apt-get', 'download']:
+                        (Path(kwargs['cwd']) / 'caddy_test.deb').touch()
+                    return subprocess.CompletedProcess(args, 0 if active else 3)
+                def call(*args):
+                    nonlocal active, failed
+                    if (args[1:2] == (failure,) and not failed):
+                        failed = True
+                        if failure == 'enable':
+                            active = True  # Partial start must also be undone.
+                        raise ValueError('temporary failure')
+                    if args[:3] == ('systemctl', 'enable', '--now'):
+                        active = True
+                    if args[:3] == ('systemctl', 'disable', '--now'):
+                        active = False
+                    return ''
+                foreign = path('/etc/telemax/sites/foreign.caddy')
+                project.write(foreign, 'foreign route\n')
+                target = path('/etc/telemax/sites/project-alpha.caddy')
+                if prior_route is not None:
+                    project.write(target, prior_route)
+                with patch.object(project, 'Path', side_effect=path), \
+                     patch.object(project.subprocess, 'run', side_effect=run), \
+                     patch.object(project, 'call', side_effect=call):
+                    with self.assertRaisesRegex(ValueError, 'temporary failure'):
+                        project.https('alpha', 'alpha.example.org', 13117)
+                    self.assertFalse(active)
+                    self.assertEqual(target.read_text() if target.exists() else None, prior_route)
+                    # The normal second command must complete the initial install.
+                    project.https('alpha', 'alpha.example.org', 13117)
+                    self.assertTrue(active)
+                    config = path('/etc/telemax/Caddyfile')
+                    unit = path('/etc/systemd/system/telemax-web.service')
+                    before = (config.read_bytes(), unit.read_bytes(), target.read_bytes())
+                    active = False  # A later intentional stop must be respected.
+                    with self.assertRaisesRegex(ValueError, 'остановлен'):
+                        project.https('alpha', 'alpha.example.org', 13117)
+                    self.assertFalse(active)
+                    self.assertEqual(before, (config.read_bytes(), unit.read_bytes(), target.read_bytes()))
+                    self.assertEqual(foreign.read_text(), 'foreign route\n')
+
     def test_firewall_rules_are_project_scoped(self):
         profile = dict(interface='tm9', subnet='10.9.0.0/24', external='eth0', port=42009)
         for table, chain, spec in vpn.firewall_rules(profile):
@@ -400,6 +451,18 @@ class ProjectIntegration(unittest.TestCase):
         finally:
             caddy.terminate()
             caddy.wait(timeout=10)
+        # A failed first validation must not poison the ordinary retry.
+        existing_route = Path('/etc/telemax/sites/project-alpha.caddy').read_bytes()
+        wrapper = Path('/tmp/project-bin/caddy')
+        wrapper.write_text('#!/bin/sh\nexit 1\n')
+        wrapper.chmod(0o755)
+        try:
+            self.cli('/usr/local/bin/telemax', '--project', 'alpha', 'https', expected=1)
+            self.assertFalse(Path('/etc/telemax/Caddyfile').exists())
+            self.assertFalse(Path('/etc/systemd/system/telemax-web.service').exists())
+            self.assertEqual(Path('/etc/telemax/sites/project-alpha.caddy').read_bytes(), existing_route)
+        finally:
+            wrapper.unlink()
         # Exercise the default shared receiver generated when 80/443 are free.
         self.cli('/usr/local/bin/telemax', '--project', 'alpha', 'https')
         self.cli('install', '-d', '-m', '700', '-o', 'telemax-web', '-g', 'telemax-web', '/run/telemax-web')
@@ -421,6 +484,14 @@ class ProjectIntegration(unittest.TestCase):
         finally:
             managed.terminate()
             managed.wait(timeout=10)
+        # Once installed successfully, an intentional stop stays stopped.
+        self.cli('systemctl', 'stop', 'telemax-web')
+        config = Path('/etc/telemax/Caddyfile')
+        target = Path('/etc/telemax/sites/project-alpha.caddy')
+        before = (config.read_bytes(), target.read_bytes())
+        self.cli('/usr/local/bin/telemax', '--project', 'alpha', 'https', expected=1)
+        self.cli('systemctl', 'is-active', '--quiet', 'telemax-web', expected=3)
+        self.assertEqual(before, (config.read_bytes(), target.read_bytes()))
 
 
 if __name__ == '__main__':

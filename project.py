@@ -178,6 +178,13 @@ WantedBy=multi-user.target
             target.unlink(missing_ok=True)
         else:
             write(target, previous)
+        if created_receiver:
+            # Only this attempt created these files; undo a partial enable/start
+            # before removing them so a normal retry is a fresh installation.
+            call('systemctl', 'disable', '--now', receiver)
+            config.unlink()
+            own_unit.unlink()
+            call('systemctl', 'daemon-reload')
         raise
     print('Маршрут проекта добавлен и проверен. Проверьте доступность собственного домена и привязку MAX.')
 
