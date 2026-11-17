@@ -55,6 +55,10 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq python3 python3-venv ffmpeg ca-certificates curl git iproute2 iptables qrencode
 install -d -m 755 "$root"
+# Restrictive umask can leave newly created parents inaccessible to the service.
+# Grant traversal only; private settings and state keep their own permissions.
+chmod a+x /opt/telemax
+if [[ -n $project ]]; then chmod a+x /opt/telemax/projects; fi
 if [[ -n $project ]]; then python3 "$src/project.py" allocate "$project"; fi
 id "$owner" >/dev/null 2>&1 || useradd --system --home-dir "$data" --create-home --shell /usr/sbin/nologin "$owner"
 install -d -m 700 -o "$owner" -g "$owner" "$data"
@@ -71,11 +75,11 @@ chmod 755 "$release/app/telemax" "$release/app/install.sh"
 python3 -m venv "$release/venv"
 "$release/venv/bin/pip" --disable-pip-version-check install -q -r "$release/app/requirements.txt"
 (cd "$release/app" && "$release/venv/bin/python" -m unittest -q test_bridge test_setup test_vpn_access test_projects)
-"$release/venv/bin/python" "$release/app/bridge.py" --help >/dev/null
-"$release/venv/bin/python" "$release/app/manage.py" --help >/dev/null
 chown -R root:root "$release"
 chmod -R go-w "$release"
 chmod -R go+rX "$release"
+runuser -u "$owner" -- "$release/venv/bin/python" "$release/app/bridge.py" --help >/dev/null
+runuser -u "$owner" -- "$release/venv/bin/python" "$release/app/manage.py" --help >/dev/null
 # Install code only after checks. Settings and state never move into a release.
 if [[ -L $root/current ]]; then
     ln -sfn "$(readlink $root/current)" $root/previous
