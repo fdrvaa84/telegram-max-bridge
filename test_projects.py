@@ -21,6 +21,22 @@ import vpn_access as vpn
 
 
 class ProjectTests(unittest.TestCase):
+    def test_login_prepare_keeps_default_enable_behavior(self):
+        source = Path(__file__).with_name('telemax').read_text()
+        block = source.split('\nlogin)\n', 1)[1].split('\n    ;;', 1)[0]
+        script = '''
+base=/synthetic; data=/synthetic; owner=synthetic; unit=synthetic
+systemctl() { return 1; }
+runuser() { printf '%s\\n' "$@"; }
+''' + block
+        for prepare in (False, True):
+            args = ['--prepare'] if prepare else []
+            result = subprocess.run(['bash', '-c', script, 'login', *args,
+                                     '--qr-file', 'login.png'], capture_output=True, text=True, check=True)
+            self.assertEqual('--enable' in result.stdout.splitlines(), not prepare)
+            self.assertNotIn('--prepare', result.stdout)
+            self.assertIn('login.png', result.stdout)
+
     def test_installer_accepts_current_ubuntu_and_rejects_unknown_systems(self):
         installer = Path(__file__).with_name('install.sh').read_text()
         check = next(line for line in installer.splitlines() if line.startswith('case "$ID:$VERSION_ID"'))
@@ -84,6 +100,7 @@ class ProjectTests(unittest.TestCase):
                     return ''
                 foreign = path('/etc/telemax/sites/foreign.caddy')
                 project.write(foreign, 'foreign route\n')
+                path('/etc/telemax').chmod(0o700)
                 target = path('/etc/telemax/sites/project-alpha.caddy')
                 if prior_route is not None:
                     project.write(target, prior_route)
@@ -97,6 +114,7 @@ class ProjectTests(unittest.TestCase):
                     # The normal second command must complete the initial install.
                     project.https('alpha', 'alpha.example.org', 13117)
                     self.assertTrue(active)
+                    self.assertEqual(path('/etc/telemax').stat().st_mode & 0o777, 0o711)
                     config = path('/etc/telemax/Caddyfile')
                     unit = path('/etc/systemd/system/telemax-web.service')
                     before = (config.read_bytes(), unit.read_bytes(), target.read_bytes())

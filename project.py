@@ -95,6 +95,9 @@ def https(name, domain, port, config=None, receiver='caddy', fragment=False):
     if not parent.exists():
         parent.mkdir(mode=0o755)
         parent.chmod(0o755)
+    # VPN setup may have created this shared parent with root-only access.
+    # Keep private project children protected while allowing the web user through.
+    parent.chmod((parent.stat().st_mode & 0o777) | 0o111)
     sites = Path('/etc/telemax/sites')
     sites.mkdir(parents=True, exist_ok=True, mode=0o755)
     target = sites / (('project-' + name if name else 'legacy') + '.caddy')

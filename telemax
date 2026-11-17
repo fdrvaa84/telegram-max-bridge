@@ -53,11 +53,16 @@ pair)
     as_owner pair
     ;;
 login)
+    enable_args=(--enable)
+    if [[ ${1:-} == --prepare ]]; then
+        enable_args=()
+        shift
+    fi
     was_active=false
     if systemctl is-active --quiet "$unit"; then was_active=true; fi
     systemctl stop "$unit"
     trap 'if [[ $was_active == true ]]; then systemctl start "$unit"; fi' EXIT
-    runuser -u "$owner" -- "$base/venv/bin/python" "$base/app/bridge.py" --config "$data/config.json" --login --enable "$@"
+    runuser -u "$owner" -- "$base/venv/bin/python" "$base/app/bridge.py" --config "$data/config.json" --login "${enable_args[@]}" "$@"
     ;;
 start)
     runuser -u "$owner" -- "$base/venv/bin/python" -c 'from pathlib import Path; import sys; sys.path.insert(0,sys.argv[1]); from bridge import load_config; c=load_config(sys.argv[2]); sys.exit(0 if c.get("enabled") and c.get("max_owner_id") and c.get("telegram_owner_id") and (Path(c["state_dir"])/"telegram.session").exists() else "Сначала привяжите MAX и войдите в Telegram.")' "$base/app" "$data/config.json"
