@@ -413,7 +413,7 @@ def main():
                 if profile_path.exists():
                     private_file(profile_path)
                     require(json.loads(profile_path.read_text()) == profile,
-                            'Параметры уже сохранены. Смена профиля требует отдельного согласования.')
+                            'В этой папке уже сохранены другие параметры. Для другого подготовленного сервера укажите отдельную закрытую папку через --state-dir.')
                 require(not (state / 'pending.json').exists(), 'Сначала завершите прерванную выдачу командой add.')
                 validate_server(profile)
                 atomic(profile_path, json.dumps(profile))
