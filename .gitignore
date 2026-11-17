@@ -9,3 +9,11 @@ __pycache__/
 config.json
 state/
 *.part
+
+# VPN device exports and recovery state are always private.
+*.conf
+*.png
+*.key
+profile.json
+pending.json
+vpn-access/

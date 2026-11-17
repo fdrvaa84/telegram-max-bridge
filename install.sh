@@ -22,7 +22,7 @@ if [[ $mode == --update ]] && systemctl is-active --quiet telemax; then
 fi
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq python3 python3-venv ffmpeg ca-certificates curl git iproute2
+apt-get install -y -qq python3 python3-venv ffmpeg ca-certificates curl git iproute2 qrencode
 id telemax >/dev/null 2>&1 || useradd --system --home-dir /var/lib/telemax --create-home --shell /usr/sbin/nologin telemax
 install -d -m 700 -o telemax -g telemax /var/lib/telemax
 install -d -m 755 /opt/telemax/releases
@@ -31,13 +31,13 @@ chmod 755 "$release"
 trap 'if [[ -n ${release:-} ]]; then rm -rf -- "$release"; fi' EXIT
 install -d -m 755 "$release/app"
 # Explicit allowlist: never package the caller's configuration or session files.
-for name in bridge.py russian_trusted_root_ca.pem cloud_copies.py manage.py test_bridge.py test_setup.py requirements.txt telemax install.sh README.md GUIDE_RU.md SECURITY.md; do
+for name in vpn_access.py bridge.py russian_trusted_root_ca.pem cloud_copies.py manage.py test_bridge.py test_setup.py test_vpn_access.py requirements.txt telemax install.sh README.md GUIDE_RU.md SECURITY.md; do
     install -m 644 "$src/$name" "$release/app/$name"
 done
 chmod 755 "$release/app/telemax" "$release/app/install.sh"
 python3 -m venv "$release/venv"
 "$release/venv/bin/pip" --disable-pip-version-check install -q -r "$release/app/requirements.txt"
-(cd "$release/app" && "$release/venv/bin/python" -m unittest -q test_bridge test_setup)
+(cd "$release/app" && "$release/venv/bin/python" -m unittest -q test_bridge test_setup test_vpn_access)
 "$release/venv/bin/python" "$release/app/bridge.py" --help >/dev/null
 "$release/venv/bin/python" "$release/app/manage.py" --help >/dev/null
 chown -R root:root "$release"
@@ -51,6 +51,7 @@ ln -s "$release" /opt/telemax/current.next
 mv -Tf /opt/telemax/current.next /opt/telemax/current
 release=''
 install -m 755 /opt/telemax/current/app/telemax /usr/local/bin/telemax
+install -m 755 /opt/telemax/current/app/vpn_access.py /usr/local/bin/telemax-vpn
 cat > /etc/systemd/system/telemax.service <<'UNIT'
 [Unit]
 Description=Personal Telegram to MAX bridge
