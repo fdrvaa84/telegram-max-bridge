@@ -298,6 +298,11 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(body['attachments'][0]['type'], max_kind)
             if kind == 'voice': self.assertIn('Голосовое', body['text'])
             if kind == 'round': self.assertIn('Кружочек', body['text'])
+            self.bridge.cleanup_files()
+            self.bridge.cleanup_files()
+            if kind:
+                source = self.s.root / 'originals' / b.hashlib.sha256(key.encode()).hexdigest() / '0'
+                self.assertFalse(source.exists())
             binding = self.s.binding('copied-' + str(i))
             self.assertEqual((binding['chat'], binding['message']), (20, message.id))
             event = self.event([{'type': max_kind, 'payload': {'token': 'fake'}}] if max_kind else [])
@@ -312,6 +317,11 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(self.requests)
             self.assertTrue(all(r.reply_to.reply_to_msg_id == message.id for r in self.requests))
             self.assertEqual(self.s.db.execute('SELECT state FROM jobs WHERE k=?', (reply_key,)).fetchone()[0], 'done')
+            self.bridge.cleanup_files()
+            self.bridge.cleanup_files()
+            if max_kind:
+                source = self.s.root / 'originals' / b.hashlib.sha256(reply_key.encode()).hexdigest() / '0'
+                self.assertFalse(source.exists())
 
     async def test_source_header_for_all_media_and_chat_types(self):
         sender = types.User(id=20, first_name='Имя', last_name='Автора')
@@ -553,6 +563,176 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
             if kind == 'round':
                 video = next(s for s in probe['streams'] if s['codec_type'] == 'video')
                 self.assertEqual((video['width'], video['height']), (384, 384))
+
+    async def test_cleanup_waits_for_all_delivery_states_and_consumers(self):
+        p = {'chat': 20, 'message': 81, 'classification': 'personal', 'kind': 'file'}
+        self.s.add('cleanup', 'max', p)
+        source = Path(self.bridge.save_original('cleanup', 0, b'original', 'test.dat', p))
+        converted = Path(str(source) + '.mp4')
+        converted.write_bytes(b'converted')
+        for state in ('pending', 'sending', 'uncertain', 'blocked', 'choice_wait'):
+            self.s.update('cleanup', state)
+            self.bridge.cleanup_files()
+            self.assertTrue(source.exists())
+            self.assertTrue(converted.exists())
+        self.s.add('consumer', 'telegram', dict(p, source=str(source)))
+        self.s.update('cleanup', 'done')
+        self.bridge.cleanup_files()
+        self.assertTrue(source.exists())
+        self.bridge.track_files('consumer', source)
+        self.s.update('consumer', 'done')
+        self.bridge.cleanup_files()
+        self.bridge.cleanup_files()
+        self.assertFalse(source.exists())
+        self.assertFalse(converted.exists())
+        self.assertFalse(source.with_suffix('.json').exists())
+        self.assertEqual(self.s.binding('copy')['topic'], 7)
+        self.assertEqual(self.s.db.execute("SELECT state FROM jobs WHERE k='cleanup'").fetchone()[0], 'done')
+
+    async def test_cleanup_recovers_historical_delivery_and_interrupted_unlink(self):
+        p = {'chat': 20, 'message': 81, 'classification': 'personal', 'kind': 'file'}
+        self.s.add('legacy', 'max', p, 'done')
+        source = Path(self.bridge.save_original('legacy', 0, b'old-original', 'old.dat', p))
+        self.s.db.execute('DELETE FROM local_files')
+        self.s.db.commit()
+        self.s.db.close()
+        self.s.lock.close()
+        self.s = b.Store(self.tmp.name)
+        self.bridge.s = self.s
+        real_unlink = Path.unlink
+        failed = []
+        def interrupt(path, *args, **kwargs):
+            if path == source and not failed:
+                failed.append(True)
+                raise OSError('simulated interrupted cleanup')
+            return real_unlink(path, *args, **kwargs)
+        with patch.object(Path, 'unlink', interrupt):
+            self.bridge.cleanup_files()
+            self.assertTrue(source.exists())
+        # Crash after removal but before committing its cleanup receipt.
+        source.unlink()
+        self.s.db.close()
+        self.s.lock.close()
+        self.s = b.Store(self.tmp.name)
+        self.bridge.s = self.s
+        self.bridge.cleanup_files()
+        self.bridge.cleanup_files()
+        self.assertFalse(source.with_suffix('.json').exists())
+        self.assertFalse(self.s.db.execute('SELECT 1 FROM local_files WHERE removed=0').fetchone())
+        self.bridge.api = AsyncMock()
+        self.assertEqual(self.s.binding('copy')['chat'], -10099)
+        self.bridge.api.assert_not_awaited()
+
+    async def test_cleanup_never_traverses_unknown_files_or_symlinks(self):
+        p = {'chat': 20, 'message': 81, 'classification': 'personal', 'kind': 'file'}
+        self.s.add('owned', 'max', p, 'done')
+        source = Path(self.bridge.save_original('owned', 0, b'owned', 'test.dat', p))
+        stranger = source.parent / 'other-file'
+        stranger.write_bytes(b'keep')
+        outside = self.s.root / 'outside'
+        outside.write_bytes(b'keep')
+        source.unlink()
+        source.symlink_to(outside)
+        self.bridge.cleanup_files()
+        self.assertTrue(source.is_symlink())
+        self.assertEqual(outside.read_bytes(), b'keep')
+        self.assertEqual(stranger.read_bytes(), b'keep')
+
+    async def test_cleanup_keeps_upload_without_confirmed_max_message(self):
+        p = {'chat': 20, 'message': 81, 'classification': 'personal', 'kind': 'file', 'text': 'caption'}
+        self.s.add('upload-only', 'max', p)
+        self.tg.get_messages.return_value = NS(noforwards=False, media=None, ttl_period=None,
+                                               file=NS(size=8, ext='.dat'))
+        self.tg.download_media = AsyncMock(return_value=b'original')
+        self.bridge.convert = AsyncMock(side_effect=lambda path, kind: path)
+        self.bridge.upload_max = AsyncMock(return_value={'type': 'file', 'payload': {'token': 'fake'}})
+        self.bridge.api = AsyncMock(side_effect=TimeoutError())
+        with self.assertRaises(TimeoutError):
+            await self.bridge.deliver_max('upload-only', p)
+        self.bridge.cleanup_files()
+        source = self.s.root / 'originals' / b.hashlib.sha256(b'upload-only').hexdigest() / '0'
+        self.assertEqual(source.read_bytes(), b'original')
+        self.assertEqual(self.s.db.execute("SELECT state FROM jobs WHERE k='upload-only'").fetchone()[0], 'uncertain')
+
+    async def test_cleanup_waits_for_remaining_telegram_attachment(self):
+        attachments = [{'type': 'file', 'filename': 'a.dat', 'payload': {'url': 'https://example.org/file'}}] * 2
+        p = b.reply_input(self.event(attachments)['message'], self.c, self.s)
+        self.s.add('multi', 'telegram', p)
+        self.bridge.download_max = AsyncMock(return_value=b'original')
+        self.bridge.convert = AsyncMock(side_effect=lambda path, kind: path)
+        calls = []
+        async def upload(path, **kwargs):
+            calls.append(path)
+            if len(calls) == 2:
+                self.bridge.cleanup_files()
+                self.assertTrue(Path(calls[0]).exists())
+                raise TimeoutError()
+            return types.InputFile(1, 1, 'a.dat', '')
+        self.tg.upload_file = AsyncMock(side_effect=upload)
+        with self.assertRaises(TimeoutError):
+            await self.bridge.deliver_telegram('multi', p)
+        self.bridge.cleanup_files()
+        self.assertTrue(all(Path(path).exists() for path in calls))
+        self.tg.upload_file = AsyncMock(return_value=types.InputFile(1, 1, 'a.dat', ''))
+        row = self.s.db.execute("SELECT payload FROM jobs WHERE k='multi'").fetchone()
+        await self.bridge.deliver_telegram('multi', json.loads(row[0]))
+        self.bridge.cleanup_files()
+        self.bridge.cleanup_files()
+        self.assertFalse(any(Path(path).exists() for path in calls))
+        self.assertTrue(all(r.reply_to.top_msg_id == 7 for r in self.requests))
+        self.assertTrue(all(r.reply_to.reply_to_msg_id == 81 for r in self.requests))
+
+    async def test_cleanup_waits_for_optional_cloud_copies_and_restart(self):
+        from cloud_copies import copy_pass
+        p = {'chat': 20, 'message': 81, 'classification': 'personal', 'kind': 'file'}
+        self.s.add('cloud', 'max', p, 'done')
+        source = Path(self.bridge.save_original('cloud', 0, b'original', 'cloud.dat', p))
+        self.c['cloud_copies'] = [{'endpoint': 'https://one.invalid', 'bucket': 'first'},
+                                  {'endpoint': 'https://two.invalid', 'bucket': 'second'}]
+        self.bridge.cleanup_files()
+        self.assertTrue(source.exists())
+        def upload(target, *args):
+            if target['bucket'] == 'second':
+                raise OSError('provider unavailable')
+        await copy_pass(self.c, self.s, uploader=upload)
+        self.bridge.cleanup_files()
+        self.assertTrue(source.exists())
+        self.s.db.close()
+        self.s.lock.close()
+        self.s = b.Store(self.tmp.name)
+        self.bridge.s = self.s
+        self.s.db.execute('UPDATE cloud_copies SET retry_at=0')
+        self.s.db.commit()
+        await copy_pass(self.c, self.s, uploader=lambda *args: None)
+        self.bridge.cleanup_files()
+        self.bridge.cleanup_files()
+        self.assertFalse(source.exists())
+        self.assertEqual(self.s.db.execute("SELECT count(*) FROM cloud_copies WHERE state='verified'").fetchone()[0], 2)
+
+
+    async def test_normal_worker_cleans_completed_files_while_paused(self):
+        p = {'chat': 20, 'message': 81, 'classification': 'personal', 'kind': 'file'}
+        self.s.add('worker-cleanup', 'max', p, 'done')
+        source = Path(self.bridge.save_original('worker-cleanup', 0, b'original', 'test.dat', p))
+        self.c['enabled'] = False
+        async def stop_after_pass(seconds):
+            self.bridge.stopping = True
+        with patch.object(b.asyncio, 'sleep', AsyncMock(side_effect=stop_after_pass)):
+            await self.bridge.work()
+        self.assertFalse(source.exists())
+        self.assertEqual(self.s.binding('copy')['topic'], 7)
+
+    async def test_max_response_without_message_receipt_preserves_original(self):
+        p = {'chat': 20, 'message': 81, 'classification': 'personal', 'kind': 'file',
+             'text': 'caption', 'max_attachments': [{'type': 'file', 'payload': {'token': 'fake'}}]}
+        self.s.add('no-receipt', 'max', p)
+        source = Path(self.bridge.save_original('no-receipt', 0, b'original', 'test.dat', p))
+        self.bridge.api = AsyncMock(return_value={'message': {'body': {'mid': ''}}})
+        with self.assertRaises(RuntimeError):
+            await self.bridge.deliver_max('no-receipt', p)
+        self.bridge.cleanup_files()
+        self.assertTrue(source.exists())
+        self.assertEqual(self.s.db.execute("SELECT state FROM jobs WHERE k='no-receipt'").fetchone()[0], 'uncertain')
 
 
 if __name__ == '__main__':

@@ -1,4 +1,4 @@
-"""Optional two independent S3-compatible copies; local bytes are never deleted."""
+"""Optional two independent S3-compatible copies; verified receipts gate bridge cleanup."""
 import asyncio
 import hashlib
 import json

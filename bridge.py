@@ -99,6 +99,8 @@ class Store:
         self.db.executescript('''
         PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
         CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY,v TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS local_files(owner TEXT NOT NULL,path TEXT NOT NULL,
+          removed INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(owner,path));
         CREATE TABLE IF NOT EXISTS jobs(k TEXT PRIMARY KEY,direction TEXT NOT NULL,
           state TEXT NOT NULL,payload TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,
           retry_at REAL NOT NULL DEFAULT 0);
@@ -257,11 +259,95 @@ class Bridge:
             raise ValueError('invalid_media_size')
         digest = hashlib.sha256(data).hexdigest()
         path = self.s.root / 'originals' / hashlib.sha256(key.encode()).hexdigest() / str(index)
+        self.track_files(key, path)
         atomic(path, data)
         atomic(path.with_suffix('.json'), json.dumps({'name': name, 'sha256': digest, 'size': len(data),
             'chat': p['chat'], 'message': p['message'], 'classification': p['classification']}).encode())
         # Optional independent cloud queues are seeded from durable local originals.
         return str(path)
+
+    def track_files(self, key, source):
+        # Register predictable outputs before writing, so crashes retain ownership.
+        with self.s.db:
+            for suffix in ('', '.json', '.jpg', '.ogg', '.m4a', '.mp4', '.part', '.json.part'):
+                self.s.db.execute('INSERT OR IGNORE INTO local_files(owner,path) VALUES (?,?)',
+                                  (key, str(source) + suffix))
+
+    def cleanup_files(self):
+        # Jobs and file ownership are durable. Re-running after any unlink is safe.
+        jobs = {r['k']: r for r in self.s.db.execute('SELECT k,direction,state,payload FROM jobs')}
+        payloads = {key: json.loads(row['payload']) for key, row in jobs.items()}
+        for key, row in jobs.items():
+            if row['direction'] not in ('max', 'telegram'):
+                continue
+            p = payloads[key]
+            count = 1 if row['direction'] == 'max' and p.get('kind') else len(p.get('attachments', []))
+            for index in range(count):
+                source = self.s.root / 'originals' / hashlib.sha256(key.encode()).hexdigest() / str(index)
+                # Adopt only historical files with their original integrity record.
+                if source.with_suffix('.json').is_file():
+                    self.track_files(key, source)
+        active_payloads = [json.dumps(payloads[key]) for key, row in jobs.items() if row['state'] != 'done']
+        paths = self.s.db.execute('SELECT DISTINCT path FROM local_files WHERE removed=0').fetchall()
+        removed = 0
+        for entry in paths:
+            path = Path(entry['path'])
+            owners = [r[0] for r in self.s.db.execute('SELECT owner FROM local_files WHERE path=?', (str(path),))]
+            if any(owner not in jobs or jobs[owner]['state'] != 'done' for owner in owners):
+                continue
+            # Only exact registered files under this bridge's private originals tree.
+            base = self.s.root / 'originals'
+            if (path.parent.parent != base or base.is_symlink() or path.parent.is_symlink()
+                    or path.is_symlink() or path.resolve().parent.parent != base.resolve()):
+                continue
+            source = path.with_name(path.name.split('.')[0])
+            if (not source.name.isdecimal() or source.is_symlink()
+                    or source.with_suffix('.json').is_symlink()
+                    or any(str(source) in text for text in active_payloads)):
+                continue
+            try:
+                meta_path = source.with_suffix('.json')
+                if path.exists():
+                    meta = json.loads(meta_path.read_text())
+                    if any(not self.cleanup_backup_ready(owner, payloads[owner], source, meta) for owner in owners):
+                        continue
+                    # Keep the integrity record until all byte files have gone.
+                    if path == meta_path and any(Path(str(source) + suffix).exists()
+                            for suffix in ('', '.jpg', '.ogg', '.m4a', '.mp4', '.part', '.json.part')):
+                        continue
+                    path.unlink()
+                    fd = os.open(path.parent, os.O_RDONLY)
+                    try:
+                        os.fsync(fd)
+                    finally:
+                        os.close(fd)
+                    removed += 1
+                with self.s.db:
+                    self.s.db.execute('UPDATE local_files SET removed=1 WHERE path=?', (str(path),))
+            except (OSError, ValueError, sqlite3.Error):
+                logging.warning('local_cleanup_pending')
+        return removed
+
+    def cleanup_backup_ready(self, key, p, source, meta):
+        targets = self.c.get('cloud_copies') or []
+        if not targets:
+            # Outstanding consumers survive removal of an optional configuration.
+            table = self.s.db.execute("SELECT 1 FROM sqlite_master WHERE name='cloud_copies'").fetchone()
+            return not table or not self.s.db.execute(
+                "SELECT 1 FROM cloud_copies WHERE path=? AND state!='verified'", (str(source),)).fetchone()
+        if len(targets) != 2 or targets[0]['endpoint'] == targets[1]['endpoint']:
+            return False
+        table = self.s.db.execute("SELECT 1 FROM sqlite_master WHERE name='cloud_copies'").fetchone()
+        if not table:
+            return False
+        for target in targets:
+            identity = hashlib.sha256((target['endpoint'] + '/' + target['bucket']).encode()).hexdigest()
+            row = self.s.db.execute('SELECT state FROM cloud_copies WHERE path=? AND target=?',
+                                    (str(source), identity)).fetchone()
+            if not row or row[0] != 'verified':
+                return False
+        return not self.s.db.execute("SELECT 1 FROM cloud_copies WHERE path=? AND state!='verified'",
+                                     (str(source),)).fetchone()
 
     def original(self, path):
         data = Path(path).read_bytes()
@@ -383,6 +469,10 @@ class Bridge:
 
     async def scan_loop(self):
         while not self.stopping:
+            try:
+                self.cleanup_files()
+            except Exception:
+                logging.warning('local_cleanup_pending')
             if self.c.get('enabled') and self.tg:
                 try:
                     await self.scan()
@@ -545,6 +635,7 @@ class Bridge:
                     raise ValueError('media_too_large')
                 data = await self.tg.download_media(m, file=bytes)
                 source = Path(self.save_original(key, 0, data, p.get('original_name') or ('attachment' + (m.file.ext or '')), p))
+            self.track_files(key, source)
             converted = await self.convert(str(source), 'max_voice' if p['kind'] == 'voice' else 'video' if p['kind'] in ('round', 'video') else p['kind'])
             kind = {'voice': 'audio', 'round': 'video'}.get(p['kind'], p['kind'])
             name = p.get('original_name') or ('attachment' + (m.file.ext or ''))
@@ -574,6 +665,8 @@ class Bridge:
                 result = await self.api('POST', '/messages?user_id=' + str(self.c['max_owner_id']),
                                         {'text': text, **({'attachments': attachments} if i == 0 and attachments else {})})
                 mid = result['message']['body']['mid']
+                if not isinstance(mid, str) or not mid.strip():
+                    raise RuntimeError('missing_delivery_receipt')
                 self.s.complete_copy(part, mid, p)
             except MaxError as e:
                 if e.code == 'attachment.not.ready':
@@ -621,6 +714,7 @@ class Bridge:
                 data = await self.download_max(attachment, p['source_mid'])
                 source = Path(self.save_original(key, index, data, name, p))
             kind = 'voice' if attachment['type'] == 'audio' else p.get('mode') if attachment['type'] == 'video' else attachment['type']
+            self.track_files(key, source)
             converted = await self.convert(str(source), kind)
             uploaded = await self.tg.upload_file(converted, file_name=name if kind == 'file' else 'image.jpg' if kind == 'image' else Path(converted).name)
             caption = p['text'] if index == 0 and kind != 'round' and len(p['text']) <= 1024 else ''
@@ -788,6 +882,10 @@ class Bridge:
 
     async def work(self):
         while not self.stopping:
+            try:
+                self.cleanup_files()
+            except Exception:
+                logging.warning('local_cleanup_pending')
             if self.c.get('enabled') and self.tg:
                 try:
                     await self.prompt_choices()
