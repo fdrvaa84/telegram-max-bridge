@@ -68,7 +68,7 @@ def configure(path):
     config = dict(api_id=api_id, api_hash=api_hash, max_bot_token=token,
         domain=domain, webhook_secret=secrets.token_hex(32), local_token=secrets.token_hex(32),
         enabled=False, max_owner_id=None, max_bot_id=None,
-        state_dir=str(Path(path).parent / 'state'), port=3117)
+        state_dir=str(Path(path).parent / 'state'), port=int(os.environ.get('TELEMAX_PROJECT_PORT', '3117')))
     save(path, config)
     print('Настройки сохранены с закрытым доступом. Пересылка ещё выключена.')
 

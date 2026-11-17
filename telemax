@@ -2,45 +2,85 @@
 set -euo pipefail
 umask 077
 [[ $EUID == 0 ]] || { echo 'Начните команду с sudo telemax.'; exit 1; }
-base=/opt/telemax/current
+project=''
+if [[ ${1:-} == --project ]]; then
+    project=${2:?Укажите имя проекта}; shift 2
+    [[ $project =~ ^[a-z][a-z0-9-]{0,19}$ ]] || { echo 'Некорректное имя проекта.'; exit 1; }
+fi
+root=/opt/telemax
+data=/var/lib/telemax
+owner=telemax
+unit=telemax
+if [[ -n $project ]]; then
+    root=/opt/telemax/projects/$project
+    data=/var/lib/telemax-projects/$project
+    owner=telemax-$project
+    unit=telemax-$project
+fi
+base=$root/current
+[[ -d $base ]] || { echo 'Укажите установленный проект: sudo telemax --project ИМЯ status. Старая установка вызывается без имени.'; exit 1; }
+# A project operation cannot race another operation or an installer.
+if [[ ${TELEMAX_INSTALL_LOCKED:-} != 1 ]]; then
+    install -d -m 700 -o root -g root /run/telemax
+    exec 9>/run/telemax/install.lock
+    flock -x 9
+fi
+if [[ ${TELEMAX_OPERATION_LOCKED:-} != "$unit" ]]; then
+    exec 8>"$root/.operation.lock"
+    flock -x 8
+fi
+export TELEMAX_OPERATION_LOCKED=$unit
+export TELEMAX_PROJECT_PORT=3117
+if [[ -n $project ]]; then
+    TELEMAX_PROJECT_PORT=$(python3 /usr/local/lib/telemax/project.py port "$project")
+fi
 cmd=${1:-help}
 shift || true
-as_owner() { runuser -u telemax -- "$base/venv/bin/python" "$base/app/manage.py" "$@"; }
+as_owner() { runuser -u "$owner" --preserve-environment -- "$base/venv/bin/python" "$base/app/manage.py" --config "$data/config.json" "$@"; }
 case "$cmd" in
 configure|clouds)
-    systemctl stop telemax
+    was_active=false
+    if systemctl is-active --quiet "$unit"; then was_active=true; fi
+    systemctl stop "$unit"
+    trap 'if [[ $was_active == true ]]; then systemctl start "$unit"; fi' EXIT
     as_owner "$cmd"
     ;;
 pair)
-    systemctl stop telemax
+    was_active=false
+    if systemctl is-active --quiet "$unit"; then was_active=true; fi
+    systemctl stop "$unit"
+    trap 'if [[ $was_active == true ]]; then systemctl start "$unit"; fi' EXIT
     as_owner pair
     ;;
 login)
-    systemctl stop telemax
-    runuser -u telemax -- "$base/venv/bin/python" "$base/app/bridge.py" --login --enable
+    was_active=false
+    if systemctl is-active --quiet "$unit"; then was_active=true; fi
+    systemctl stop "$unit"
+    trap 'if [[ $was_active == true ]]; then systemctl start "$unit"; fi' EXIT
+    runuser -u "$owner" -- "$base/venv/bin/python" "$base/app/bridge.py" --config "$data/config.json" --login --enable
     ;;
 start)
-    runuser -u telemax -- "$base/venv/bin/python" -c 'from pathlib import Path; import sys; sys.path.insert(0,"/opt/telemax/current/app"); from bridge import load_config; c=load_config("/var/lib/telemax/config.json"); sys.exit(0 if c.get("enabled") and c.get("max_owner_id") and c.get("telegram_owner_id") and (Path(c["state_dir"])/"telegram.session").exists() else "Сначала привяжите MAX и войдите в Telegram.")'
-    systemctl enable --now telemax
+    runuser -u "$owner" -- "$base/venv/bin/python" -c 'from pathlib import Path; import sys; sys.path.insert(0,sys.argv[1]); from bridge import load_config; c=load_config(sys.argv[2]); sys.exit(0 if c.get("enabled") and c.get("max_owner_id") and c.get("telegram_owner_id") and (Path(c["state_dir"])/"telegram.session").exists() else "Сначала привяжите MAX и войдите в Telegram.")' "$base/app" "$data/config.json"
+    systemctl enable --now "$unit"
     as_owner subscribe
     echo 'Передача запущена и включена после перезагрузки. Теперь проверьте живой обмен.'
     ;;
 stop)
-    systemctl disable --now telemax
+    systemctl disable --now "$unit"
     as_owner unsubscribe
     echo 'Передача остановлена. Сохранённые сообщения и вход не удалены.'
     ;;
 restart)
-    systemctl restart telemax
+    systemctl try-restart "$unit"
     ;;
 status)
     as_owner status
-    if systemctl is-active --quiet telemax; then echo 'Служба работает.'; else echo 'Служба остановлена.'; fi
-    if systemctl is-enabled --quiet telemax; then echo 'Запуск после перезагрузки включён.'; else echo 'Запуск после перезагрузки выключен.'; fi
+    if systemctl is-active --quiet "$unit"; then echo 'Служба работает.'; else echo 'Служба остановлена.'; fi
+    if systemctl is-enabled --quiet "$unit"; then echo 'Запуск после перезагрузки включён.'; else echo 'Запуск после перезагрузки выключен.'; fi
     ;;
 logs)
     # Print only a fixed vocabulary, never arbitrary HTTP, media, or Telegram output.
-    journalctl -u telemax --since '1 hour ago' --no-pager -o cat | "$base/venv/bin/python" -c '
+    journalctl -u "$unit" --since '1 hour ago' --no-pager -o cat | "$base/venv/bin/python" -c '
 import sys
 labels={"source_read_pending":"Чтение Telegram отложено; сохранённая позиция не пропущена.","delivery_pending":"Отправка ожидает следующей попытки.","delivery_blocked":"Отправка остановлена: проверьте формат или права.","incoming_reply_pending":"Приём ответа не завершён; ожидается повтор от MAX.","choice_delivery_pending":"Вопрос о формате видео пока не доставлен.","callback_ack_pending":"Подтверждение выбора MAX отложено.","cloud_copy_pending":"Облачная копия пока не подтверждена.","bridge_ready":"Передача подключена."}
 seen=False
@@ -52,68 +92,11 @@ if not seen: print("За последний час записей передач
 subscribe) as_owner subscribe ;;
 https)
     domain=$(as_owner domain)
-    for port in 80 443; do
-        if [[ -n $(ss -H -ltn "sport = :$port") ]]; then
-            echo "Порт $port уже занят. Ничего не меняли. Сначала разберитесь с другой службой по инструкции."
-            exit 1
-        fi
-    done
-    [[ ! -f /etc/systemd/system/telemax-web.service ]] || { echo 'Защищённый адрес уже установлен. Проверьте sudo telemax status и инструкцию.'; exit 1; }
-    # Extract the distribution's Caddy package without running its system installer.
-    # This never enables or replaces a system-wide web server.
-    temp=$(mktemp -d)
-    trap 'rm -rf -- "$temp"' EXIT
-    (cd "$temp" && apt-get download caddy >/dev/null)
-    install -d -m 755 /opt/telemax/web
-    dpkg-deb -x "$temp"/caddy_*.deb /opt/telemax/web
-    id telemax-web >/dev/null 2>&1 || useradd --system --home-dir /var/lib/telemax-web --create-home --shell /usr/sbin/nologin telemax-web
-    install -d -m 700 -o telemax-web -g telemax-web /var/lib/telemax-web
-    install -d -m 755 /etc/telemax
-    cat > /etc/telemax/Caddyfile <<CADDY
-{
-    admin off
-}
-$domain {
-    @bridge path /webhook /health
-    handle @bridge {
-        reverse_proxy 127.0.0.1:3117
-    }
-    handle {
-        respond 404
-    }
-}
-CADDY
-    chmod 644 /etc/telemax/Caddyfile
-    /opt/telemax/web/usr/bin/caddy validate --config /etc/telemax/Caddyfile --adapter caddyfile >/dev/null
-    cat > /etc/systemd/system/telemax-web.service <<'UNIT'
-[Unit]
-Description=HTTPS endpoint for personal MAX bridge
-Wants=network-online.target
-After=network-online.target
-[Service]
-User=telemax-web
-Group=telemax-web
-Environment=HOME=/var/lib/telemax-web
-ExecStart=/opt/telemax/web/usr/bin/caddy run --config /etc/telemax/Caddyfile --adapter caddyfile
-Restart=on-failure
-RestartSec=10
-UMask=0077
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/var/lib/telemax-web
-[Install]
-WantedBy=multi-user.target
-UNIT
-    chmod 644 /etc/systemd/system/telemax-web.service
-    systemctl daemon-reload
-    systemctl enable --now telemax-web
-    echo 'Получение сертификата запущено. Подождите минуту, затем sudo telemax pair.'
+    port=$("$base/venv/bin/python" -c 'import json,sys; print(json.load(open(sys.argv[1]))["port"])' "$data/config.json")
+    python3 /usr/local/lib/telemax/project.py https "$project" "$domain" "$port" "$@"
     ;;
 https-update)
+    [[ -z $project ]] || { echo 'Это общий приёмник всех проектов. Обновляйте его отдельно штатными средствами по инструкции.'; exit 1; }
     [[ -f /etc/systemd/system/telemax-web.service ]] || { echo 'Сначала настройте защищённый адрес.'; exit 1; }
     temp=$(mktemp -d)
     trap 'rm -rf -- "$temp"' EXIT
@@ -130,20 +113,18 @@ update)
     temp=$(mktemp -d)
     trap 'rm -rf -- "$temp"' EXIT
     git clone --quiet --depth 1 --branch main https://github.com/fdrvaa84/telegram-max-bridge.git "$temp/source"
-    bash "$temp/source/install.sh" --update
-    if [[ -f /etc/systemd/system/telemax-web.service ]]; then /usr/local/bin/telemax https-update; fi
+    TELEMAX_INSTALL_LOCKED=1 bash "$temp/source/install.sh" ${project:+--project "$project"} --update
     ;;
 rollback)
-    [[ -L /opt/telemax/previous ]] || { echo 'Предыдущая программа не сохранена.'; exit 1; }
+    [[ -L $root/previous ]] || { echo 'Предыдущая программа не сохранена.'; exit 1; }
     was_active=false
-    if systemctl is-active --quiet telemax; then was_active=true; fi
+    if systemctl is-active --quiet "$unit"; then was_active=true; fi
     # The installer restores a previously running service even if the new one failed.
     if [[ ${1:-} == --restore-active ]]; then was_active=true; fi
-    systemctl stop telemax
-    ln -s "$(readlink /opt/telemax/previous)" /opt/telemax/current.rollback
-    mv -Tf /opt/telemax/current.rollback /opt/telemax/current
-    install -m 755 /opt/telemax/current/app/telemax /usr/local/bin/telemax
-    if [[ $was_active == true ]]; then systemctl start telemax; fi
+    systemctl stop "$unit"
+    ln -s "$(readlink $root/previous)" $root/current.rollback
+    mv -Tf $root/current.rollback $root/current
+    if [[ $was_active == true ]]; then systemctl start "$unit"; fi
     echo 'Прежняя программа возвращена. Вход, очередь и связь сообщений сохранены.'
     ;;
 help|*) echo 'Команды: configure, https, pair, login, start, status, logs, restart, subscribe, update, rollback, stop, clouds, https-update.' ;;

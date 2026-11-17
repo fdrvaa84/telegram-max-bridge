@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import shutil
 import signal
+import secrets
 import stat
 import subprocess
 import sys
@@ -380,10 +381,193 @@ def add(state, profile, name):
         raise
 
 
+def project_state(name):
+    require(re.fullmatch(r'[a-z][a-z0-9-]{0,19}', name), 'Некорректное имя проекта.')
+    require((Path('/opt/telemax/projects') / name / 'project.json').is_file(),
+            'Сначала установите выбранный проект.')
+    return Path('/etc/telemax/projects') / name / 'vpn'
+
+
+def firewall_rules(profile):
+    interface, subnet, external = profile['interface'], profile['subnet'], profile['external']
+    tag = ['-m', 'comment', '--comment', 'telemax-' + interface]
+    return [
+        ('filter', 'INPUT', ['-p', 'udp', '--dport', str(profile['port']), *tag, '-j', 'ACCEPT']),
+        ('filter', 'FORWARD', ['-i', interface, '-o', external, '-s', subnet, *tag, '-j', 'ACCEPT']),
+        ('filter', 'FORWARD', ['-i', external, '-o', interface, '-d', subnet,
+                             '-m', 'conntrack', '--ctstate', 'RELATED,ESTABLISHED', *tag, '-j', 'ACCEPT']),
+        ('nat', 'POSTROUTING', ['-s', subnet, '-o', external, *tag, '-j', 'MASQUERADE'])]
+
+
+def firewall(profile, enable):
+    for table, chain, spec in firewall_rules(profile):
+        check = subprocess.run(['iptables', '-w', '10', '-t', table, '-C', chain, *spec],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+        require(check.returncode in (0, 1), 'Не удалось проверить действующие правила трафика.')
+        if enable and check.returncode == 1:
+            run('iptables', '-w', '10', '-t', table, '-I', chain, '1', *spec)
+        elif not enable and check.returncode == 0:
+            run('iptables', '-w', '10', '-t', table, '-D', chain, *spec)
+
+
+def vpn_lifecycle(state, enable):
+    private_file(state / 'creation.json')
+    profile = json.loads((state / 'creation.json').read_text())
+    config = Path(profile['server_config'])
+    private_file(config)
+    interface = profile['interface']
+    interfaces = run('awg', 'show', 'interfaces').split()
+    if not enable:
+        # Only remove rules and the interface reserved by this project's record.
+        if interface in interfaces:
+            validate_server(profile)
+            run('awg-quick', 'down', str(config))
+        firewall(profile, False)
+        return
+    created = False
+    try:
+        if interface not in interfaces:
+            run('awg-quick', 'up', str(config))
+            created = True
+        validate_server(profile)
+        firewall(profile, True)
+    except BaseException:
+        # awg-quick handles partial interface setup itself. Clean our exact rules.
+        firewall(profile, False)
+        if created:
+            run('awg-quick', 'down', str(config))
+        raise
+
+
+def create_project_vpn(state, name, public_ip, dns):
+    for program in ('awg', 'awg-quick', 'amneziawg-go', 'ip', 'iptables', 'qrencode'):
+        require(shutil.which(program), 'Нужны существующие awg, awg-quick, amneziawg-go, iproute2, iptables и qrencode. Установите только недостающие программы по официальной инструкции.')
+    public_ip = str(ipaddress.IPv4Address(public_ip))
+    dns = ', '.join(str(ipaddress.ip_address(v.strip())) for v in dns.split(','))
+    record = state / 'creation.json'
+    initialized = (state / 'profile.json').exists()
+    unit = 'telemax-vpn-' + name
+    was_active = subprocess.run(['systemctl', 'is-active', '--quiet', unit],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    private_dir(Path('/run/telemax'))
+    with locked(Path('/run/telemax/vpn-create.lock')):
+        if record.exists():
+            private_file(record)
+            profile = json.loads(record.read_text())
+            require(profile['endpoint'].rsplit(':', 1)[0] == public_ip and profile['dns'] == dns,
+                    'Проект уже имеет другие параметры VPN. Существующие данные сохранены.')
+        else:
+            require(not (state / 'profile.json').exists(), 'Проект уже привязан к подготовленному VPN.')
+            routes = json.loads(run('ip', '-j', '-4', 'route', 'show', 'table', 'all'))
+            occupied = [ipaddress.ip_network(v['dst'], strict=False) for v in routes
+                        if v.get('dst') not in (None, 'default')]
+            links = {v['ifname'] for v in json.loads(run('ip', '-j', 'link'))}
+            ports = set()
+            for item in Path('/etc/telemax/projects').glob('*/vpn/creation.json'):
+                other = json.loads(item.read_text())
+                occupied.append(ipaddress.ip_network(other['subnet']))
+                links.add(other['interface'])
+                ports.add(other['port'])
+            # Include stopped conventional VPN files as reservations as well.
+            for directory in ('/etc/amnezia/amneziawg', '/etc/wireguard'):
+                for config in Path(directory).glob('*.conf'):
+                    server, _ = parse(config.read_text())
+                    if server.get('listenport'):
+                        ports.add(int(server['listenport']))
+                    occupied.extend(networks(server.get('address', '')))
+                    links.add(config.stem)
+            subnet = None
+            for block in ('10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16'):
+                subnet = next((net for net in ipaddress.ip_network(block).subnets(new_prefix=24)
+                               if not any(net.overlaps(other) for other in occupied)), None)
+                if subnet:
+                    break
+            require(subnet is not None, 'Свободная частная подсеть не найдена.')
+            interface = next(('tm' + str(i) for i in range(1, 10000) if 'tm' + str(i) not in links), None)
+            require(interface is not None, 'Свободное имя подключения не найдено.')
+            # All UDP listeners, including wildcard and IPv6, reserve their ports.
+            for line in run('ss', '-H', '-lun').splitlines():
+                fields = line.split()
+                if len(fields) > 4:
+                    ports.add(int(fields[3].rsplit(':', 1)[1]))
+            # Published container UDP ports may use DNAT without a listening socket.
+            for line in run('iptables-save', '-t', 'nat').splitlines():
+                if '-p udp' not in line or not any(target in line for target in ('-j DNAT', '-j REDIRECT')):
+                    continue
+                match = re.search(r'--dports? ([0-9,:-]+)', line)
+                if match:
+                    for value in match[1].split(','):
+                        ends = re.split('[:-]', value)
+                        ports.update(range(int(ends[0]), int(ends[-1]) + 1))
+            port = next((p for p in range(42000, 65000) if p not in ports), None)
+            require(port is not None, 'Свободный UDP-порт не найден.')
+            external_routes = json.loads(run('ip', '-j', '-4', 'route', 'get', '1.1.1.1'))
+            require(external_routes and external_routes[0].get('dev'), 'Внешний путь трафика не найден.')
+            external = external_routes[0]['dev']
+            require(re.fullmatch(r'[a-zA-Z0-9_.:-]{1,15}', external), 'Неподдерживаемое имя внешнего подключения.')
+            config = state / (interface + '.conf')
+            profile = dict(server_config=str(config), interface=interface, endpoint=f'{public_ip}:{port}',
+                           dns=dns, routes='0.0.0.0/0, ::/0', client_format='1',
+                           subnet=str(subnet), port=port, external=external)
+            private = key(run('awg', 'genkey').strip())
+            headers = secrets.SystemRandom().sample(range(100000, 2000000000), 4)
+            content = (f'[Interface]\nPrivateKey = {private}\nAddress = {subnet.network_address + 1}/24\n'
+                       f'ListenPort = {port}\nMTU = 1280\nSaveConfig = false\n'
+                       'Jc = 4\nJmin = 40\nJmax = 70\nS1 = 56\nS2 = 120\n' +
+                       ''.join(f'H{i} = {value}\n' for i, value in enumerate(headers, 1)))
+            # A durable record reserves names, port and subnet before live changes.
+            # Keep initial bytes in the private record to recover an interrupted write.
+            profile['initial_config'] = content
+            atomic(record, json.dumps(profile))
+        config = Path(profile['server_config'])
+        if not config.exists():
+            require(not initialized, 'Серверные настройки проекта утрачены. Сохранённые устройства и действующий VPN не изменены; восстановите закрытую копию настроек.')
+            atomic(config, profile['initial_config'])
+        private_file(config)
+        unit = 'telemax-vpn-' + name
+        binary = Path('/usr/local/bin/telemax-vpn')
+        require(binary.is_file(), 'Установите программу выдачи через установщик проекта.')
+        unit_path = Path('/etc/systemd/system') / (unit + '.service')
+        unit_text = f'''[Unit]
+Description=AmneziaWG for Telemax project {name}
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart={binary} --project {name} up
+ExecStop={binary} --project {name} down
+TimeoutStartSec=120
+TimeoutStopSec=120
+[Install]
+WantedBy=multi-user.target
+'''
+        if unit_path.exists():
+            require(unit_path.read_text() == unit_text, 'Имя службы уже занято другой настройкой.')
+        else:
+            atomic(unit_path, unit_text)
+        # Forwarding is shared. Never reset it while stopping one project.
+        atomic(Path('/etc/sysctl.d') / ('80-' + unit + '.conf'), 'net.ipv4.ip_forward=1\n')
+        if run('sysctl', '-n', 'net.ipv4.ip_forward').strip() != '1':
+            run('sysctl', '-w', 'net.ipv4.ip_forward=1')
+        run('systemctl', 'daemon-reload')
+    # Do not hold the project lock while systemd's child calls up/down.
+    if not initialized:
+        run('systemctl', 'enable', '--now', unit)
+    if not initialized or was_active:
+        validate_server(profile)
+    atomic(state / 'profile.json', json.dumps(profile))
+    print(('Отдельный VPN проекта запущен и проверен на сервере. ' if not initialized or was_active
+           else 'Прежнее остановленное состояние VPN проекта сохранено. ') + 'UDP-порт: ' + str(profile['port']))
+    print('Разрешите этот порт в панели провайдера. IPv4 настроен; IPv6 направляется в туннель без выхода. Проверьте блокировку обхода в приложении и реальную передачу с устройства.')
+
+
 def main():
     os.umask(0o077)
     parser = argparse.ArgumentParser(description='Закрытая выдача отдельных доступов AmneziaWG.')
-    parser.add_argument('--state-dir', type=Path, default=Path('/etc/telemax-vpn'))
+    parser.add_argument('--state-dir', type=Path)
+    parser.add_argument('--project', help='имя установленного отдельного проекта')
     commands = parser.add_subparsers(dest='command', required=True)
     setup = commands.add_parser('prepare', help='сохранить проверенные параметры подготовленного сервера')
     setup.add_argument('--server-config', type=Path, required=True)
@@ -392,13 +576,29 @@ def main():
     setup.add_argument('--routes', required=True, help='клиентские маршруты через запятую')
     setup.add_argument('--client-format', choices=['1', '2'], required=True,
                        help='проверенная поддержка AWG1 или AWG2 установленным приложением')
+    create = commands.add_parser('create', help='создать отдельный совместимый AWG1 VPN проекта')
+    create.add_argument('--public-ip', required=True)
+    create.add_argument('--dns', required=True)
+    commands.add_parser('up', help='запуск VPN выбранного проекта')
+    commands.add_parser('down', help='остановка VPN выбранного проекта')
     issue = commands.add_parser('add', help='выдать или повторно получить доступ по имени устройства')
     issue.add_argument('name')
     args = parser.parse_args()
     require(os.geteuid() == 0, 'Запустите через sudo.')
-    state = args.state_dir.absolute()
+    require(not (args.project and args.state_dir), 'Выберите --project либо --state-dir.')
+    state = project_state(args.project) if args.project else (args.state_dir or Path('/etc/telemax-vpn')).absolute()
+    if args.command == 'create':
+        require(args.project, 'Для нового VPN укажите --project.')
+        private_dir(state)
+        with locked(state / '.create.lock'):
+            create_project_vpn(state, args.project, args.public_ip, args.dns)
+        return 0
+    require(args.command not in ('up', 'down') or args.project, 'Укажите --project.')
     private_dir(state)
     with locked(state / '.lock'):
+        if args.command in ('up', 'down'):
+            vpn_lifecycle(state, args.command == 'up')
+            return 0
         profile_path = state / 'profile.json'
         if args.command == 'prepare':
             config = args.server_config.absolute()
