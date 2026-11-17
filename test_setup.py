@@ -180,6 +180,41 @@ class SetupTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(db.execute("SELECT v FROM kv WHERE k='since'").fetchone())
             db.close()
 
+    async def test_private_login_qr_refreshes_without_printing_token_and_removes_file(self):
+        from types import SimpleNamespace as NS
+        from contextlib import redirect_stdout
+        import io
+        with tempfile.TemporaryDirectory() as root:
+            destination = Path(root) / 'telegram-login.png'
+            images = []
+            qr = NS(url='tg://synthetic-first', recreate=AsyncMock())
+            async def wait(timeout):
+                self.assertEqual(timeout, 30)
+                self.assertEqual(destination.stat().st_mode & 0o777, 0o600)
+                images.append(destination.read_bytes())
+                if len(images) == 1:
+                    qr.url = 'tg://synthetic-second'
+                    raise asyncio.TimeoutError()
+            qr.wait = AsyncMock(side_effect=wait)
+            client = NS(qr_login=AsyncMock(return_value=qr))
+            output = io.StringIO()
+            with redirect_stdout(output), patch('qrcode.QRCode.print_ascii') as terminal_qr:
+                await bridge.private_qr_login(client, Path(root), 'telegram-login.png')
+            qr.recreate.assert_awaited_once()
+            self.assertNotEqual(images[0], images[1])
+            self.assertFalse(destination.exists())
+            self.assertNotIn('tg://', output.getvalue())
+            terminal_qr.assert_not_called()
+            with self.assertRaises(ValueError):
+                await bridge.private_qr_login(client, Path(root), '../outside.png')
+            qr.recreate.reset_mock()
+            qr.wait = AsyncMock(side_effect=asyncio.TimeoutError())
+            with redirect_stdout(output), self.assertRaises(asyncio.TimeoutError):
+                await bridge.private_qr_login(client, Path(root), 'telegram-login.png')
+            self.assertEqual(qr.wait.await_count, 10)
+            self.assertEqual(qr.recreate.await_count, 9)
+            self.assertFalse(destination.exists())
+
     async def test_regular_entrypoint_runs_http_with_synthetic_bot(self):
         with tempfile.TemporaryDirectory() as root:
             config=Path(root)/'config.json'

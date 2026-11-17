@@ -928,6 +928,32 @@ class Bridge:
             await asyncio.sleep(5)
 
 
+async def private_qr_login(client, root, filename):
+    # File-only QR is opt-in. Never place its short-lived login token in output.
+    if Path(filename).name != filename or not filename.endswith('.png'):
+        raise ValueError('private_qr_filename_required')
+    import io
+    import qrcode
+    destination = root / filename
+    qr = await client.qr_login()
+    try:
+        for attempt in range(10):
+            image = qrcode.make(qr.url)
+            buffer = io.BytesIO()
+            image.save(buffer, format='PNG')
+            atomic(destination, buffer.getvalue())
+            print('Закрытый QR входа обновлён: ' + str(destination), flush=True)
+            try:
+                await qr.wait(timeout=30)
+                return
+            except asyncio.TimeoutError:
+                if attempt == 9:
+                    raise
+                await qr.recreate()
+    finally:
+        destination.unlink(missing_ok=True)
+
+
 async def main(args):
     os.umask(0o077)
     logging.basicConfig(level=logging.WARNING, format='%(asctime)s %(message)s')
@@ -960,12 +986,15 @@ async def main(args):
                 raise ValueError('private_terminal_required')
             if not await client.is_user_authorized():
                 import qrcode
-                qr = await client.qr_login()
-                code = qrcode.QRCode()
-                code.add_data(qr.url)
-                code.print_ascii(invert=True)
                 try:
-                    await qr.wait(timeout=60)
+                    if getattr(args, 'qr_file', None):
+                        await private_qr_login(client, s.root, args.qr_file)
+                    else:
+                        qr = await client.qr_login()
+                        code = qrcode.QRCode()
+                        code.add_data(qr.url)
+                        code.print_ascii(invert=True)
+                        await qr.wait(timeout=60)
                 except errors.SessionPasswordNeededError:
                     import getpass
                     await client.sign_in(password=getpass.getpass('Пароль Telegram (ввод скрыт): '))
@@ -1046,6 +1075,7 @@ if __name__ == '__main__':
     parser.add_argument('--check', action='store_true')
     parser.add_argument('--login', action='store_true')
     parser.add_argument('--enable', action='store_true')
+    parser.add_argument('--qr-file', help='Закрытый PNG в папке состояния; обновление до пяти минут без QR в терминале')
     args = parser.parse_args()
     try:
         asyncio.run(main(args))
