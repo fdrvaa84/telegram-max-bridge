@@ -30,7 +30,7 @@ if [[ ${TELEMAX_INSTALL_LOCKED:-} != 1 ]]; then
     flock -x 9
 fi
 source /etc/os-release
-case "$ID:$VERSION_ID" in ubuntu:22.04|ubuntu:24.04|debian:12|debian:13) ;; *) echo 'Нужны Ubuntu 22.04/24.04 или Debian 12/13.'; exit 1;; esac
+case "$ID:$VERSION_ID" in ubuntu:22.04|ubuntu:24.04|ubuntu:26.04|debian:12|debian:13) ;; *) echo 'Нужны Ubuntu 22.04/24.04/26.04 или Debian 12/13.'; exit 1;; esac
 [[ $(uname -m) == x86_64 ]] || { echo 'Нужен сервер x86-64.'; exit 1; }
 if [[ $mode != --prepare-only && ! -d /run/systemd/system ]]; then
     echo 'На сервере должен работать systemd. Для проверки в контейнере есть --prepare-only.'; exit 1
@@ -53,7 +53,7 @@ fi
 export TELEMAX_INSTALL_LOCKED=1
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq python3 python3-venv ffmpeg ca-certificates curl git iproute2 qrencode
+apt-get install -y -qq python3 python3-venv ffmpeg ca-certificates curl git iproute2 iptables qrencode
 install -d -m 755 "$root"
 if [[ -n $project ]]; then python3 "$src/project.py" allocate "$project"; fi
 id "$owner" >/dev/null 2>&1 || useradd --system --home-dir "$data" --create-home --shell /usr/sbin/nologin "$owner"

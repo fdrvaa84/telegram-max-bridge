@@ -21,6 +21,17 @@ import vpn_access as vpn
 
 
 class ProjectTests(unittest.TestCase):
+    def test_installer_accepts_current_ubuntu_and_rejects_unknown_systems(self):
+        installer = Path(__file__).with_name('install.sh').read_text()
+        check = next(line for line in installer.splitlines() if line.startswith('case "$ID:$VERSION_ID"'))
+        for system, version, accepted in [('ubuntu', '26.04', True), ('ubuntu', '24.04', True),
+                                          ('debian', '13', True), ('ubuntu', '99.99', False)]:
+            result = subprocess.run(['bash', '-c', check], env=dict(os.environ, ID=system, VERSION_ID=version),
+                                    capture_output=True)
+            self.assertEqual(result.returncode == 0, accepted, (system, version))
+        dependencies = next(line for line in installer.splitlines() if line.startswith('apt-get install'))
+        self.assertIn('iptables', dependencies.split())
+
     def test_names_and_routes_reject_injection(self):
         for name in ('../other', 'bad/name', '-x', 'a' * 21, 'Test'):
             with self.assertRaises(ValueError):
