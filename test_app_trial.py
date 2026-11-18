@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import AsyncMock
 
 from aiohttp.test_utils import TestClient, TestServer
-from app_trial import Trial, SafeError, inspect_app, make_app
+from app_trial import Trial, SafeError, inspect_app, make_app, HTML
 
 KEY = 'a' * 32
 EXISTING = f'<title>App configuration</title><form id="app_edit_form">App api_id: 12345 App api_hash: {KEY}</form>'
@@ -48,6 +48,9 @@ class TrialTests(unittest.IsolatedAsyncioTestCase):
         self.t.call = AsyncMock(side_effect=[CREATE, '', EXISTING])
         await self.t.obtain()
         self.assertTrue(self.t.created)
+        proof = json.loads((self.root / 'preconfirmation-proof.json').read_text())
+        self.assertEqual(proof['application_result'], 'created_new')
+        self.assertFalse(proof['personal_login'])
         self.assertEqual(self.t.call.await_args_list[1].args[0], '/apps/create')
         self.assertEqual(json.loads((self.root / 'application.json').read_text())['api_hash'], KEY)
 
@@ -128,6 +131,41 @@ class TrialTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(SafeError, 'неверен'):
             await self.t.action('bridge_password', 'PRIVATE PASSWORD')
         self.assertEqual(list(self.root.iterdir()), [])
+
+    async def test_bridge_reuses_owner_phone_only_after_confirmation(self):
+        self.t.phase = 'bridge_phone'
+        self.t.keys = {'owner_phone': self.t.phone}
+        self.t.client = AsyncMock()
+        self.t.client.is_user_authorized.return_value = False
+        with self.assertRaises(SafeError):
+            await self.t.action('bridge_phone', '')
+        self.t.client.send_code_request.assert_not_called()
+        await self.t.action('bridge_phone', '+19995550456', True)
+        self.t.client.send_code_request.assert_awaited_once_with(self.t.keys['owner_phone'])
+        self.assertEqual(self.t.phase, 'bridge_code')
+
+    async def test_login_waits_for_operator_without_browser_secret_action(self):
+        from types import SimpleNamespace
+        self.t.call = AsyncMock(return_value=EXISTING)
+        await self.t.obtain()
+        self.t.client = AsyncMock()
+        self.t.client.get_me.return_value = SimpleNamespace(phone=self.t.phone[1:])
+        await self.t.finish()
+        self.assertEqual(self.t.phase, 'max_pending')
+        self.assertEqual(self.t.message, 'Telegram подключён. Помощник готовит подключение MAX.')
+        proof = json.loads((self.root / 'preconfirmation-proof.json').read_text())
+        self.assertEqual(proof['application_result'], 'read_existing')
+        self.assertTrue(proof['personal_login'])
+        self.assertNotIn(self.t.phone, json.dumps(proof))
+        self.assertNotIn(KEY, json.dumps(proof))
+        self.assertEqual(Trial(self.root).phase, 'max_pending')
+        self.t.check_max = AsyncMock()
+        with self.assertRaises(SafeError):
+            await self.t.action('max_token', 'PRIVATE TOKEN')
+        self.t.check_max.assert_not_called()
+        self.assertNotIn('max_token', HTML)
+        self.assertIn("input.hidden=['read_app','bridge_phone'].includes(phase)", HTML)
+        self.assertIn('Подтвердить вход пересылки', HTML)
 
     async def test_browser_security_and_safe_errors(self):
         app = make_app(self.t, 'private-password', 18789)

@@ -98,12 +98,25 @@ class Trial:
         self.lock = asyncio.Lock()
         self.keys = None
         self.created = False
+        proof = root / 'preconfirmation-proof.json'
+        self.proof = json.loads(proof.read_text()) if proof.exists() else {}
         keyfile = root / 'application.json'
         if keyfile.exists():
             self.keys = json.loads(keyfile.read_text())
             self.phone = self.keys['owner_phone']
             self.phase = 'bridge_phone'
             self.message = 'Настройки своего приложения сохранены. Шаг 2: отдельный личный вход пересылки.'
+            if self.proof.get('personal_login') is True:
+                self.phase = 'max_pending'
+                self.message = 'Telegram подключён. Помощник готовит подключение MAX.'
+
+    def save_proof(self, **facts):
+        self.proof.update(facts)
+        self.proof['phase'] = self.phase
+        path = self.root / 'preconfirmation-proof.json'
+        temporary = path.with_suffix('.tmp')
+        private_write(temporary, self.proof)
+        os.replace(temporary, path)
 
     async def call(self, path, form=None):
         if self.http is None:
@@ -142,6 +155,8 @@ class Trial:
         self.message = ('Новое приложение создано и прочитано.' if self.created else
             'Существующее приложение прочитано и сохранено без изменений. Создание нового не проверено.')
         self.message += ' Шаг 2: отдельный личный вход самой пересылки.'
+        self.save_proof(application_result='created_new' if self.created else 'read_existing',
+            personal_login=False)
         await self.http.close()
         self.http = None
         self.random_hash = None
@@ -181,10 +196,10 @@ class Trial:
             elif action == 'read_app' and self.phase == 'read_app':
                 await self.obtain()
             elif action == 'bridge_phone' and self.phase == 'bridge_phone':
-                self.validate_phone(value)
-                if self.phone and value != self.phone:
-                    raise SafeError('Для пересылки нужен тот же номер, что для собственного приложения.')
-                self.phone = value
+                if not consent:
+                    raise SafeError('Нажмите «Подтвердить вход пересылки», чтобы запросить код.')
+                self.phone = self.keys['owner_phone']
+                self.validate_phone(self.phone)
                 if self.client is None:
                     self.client = TelegramClient(str(self.root / 'trial'), self.keys['api_id'],
                         self.keys['api_hash'], request_retries=0, flood_sleep_threshold=0,
@@ -196,7 +211,7 @@ class Trial:
                 if time.monotonic() - self.last_send < 60:
                     raise SafeError('Перед новым запросом кода подождите минуту.')
                 self.last_send = time.monotonic()
-                sent = await self.client.send_code_request(value)
+                sent = await self.client.send_code_request(self.phone)
                 self.code_hash = sent.phone_code_hash
                 self.deadline = time.monotonic() + 300
                 self.phase = 'bridge_code'
@@ -225,8 +240,6 @@ class Trial:
                 except errors.PasswordHashInvalidError:
                     raise SafeError('Дополнительный пароль неверен.') from None
                 await self.finish()
-            elif action == 'max_token' and self.phase == 'max_token':
-                await self.check_max(value)
             else:
                 raise SafeError('Действие сейчас недоступно. Обновите страницу.')
 
@@ -239,8 +252,9 @@ class Trial:
         me = await self.client.get_me()
         if not me or '+' + (me.phone or '') != self.phone:
             raise SafeError('Принадлежность входа нужному номеру не подтверждена. Пересылка выключена.')
-        self.phase = 'max_token'
-        self.message = 'Личный вход подтверждён. Введите ключ отдельного свободного бота MAX. Действующий бот не подходит. Проверка только прочитает его состояние; пересылка пока выключена.'
+        self.phase = 'max_pending'
+        self.message = 'Telegram подключён. Помощник готовит подключение MAX.'
+        self.save_proof(personal_login=True)
         self.code_hash = None
         await self.client.disconnect()
         self.client = None
@@ -277,8 +291,8 @@ class Trial:
 
 
 HTML = '''<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="referrer" content="no-referrer"><title>Пробное подключение</title><style>body{font:18px system-ui;max-width:700px;margin:40px auto;padding:16px}input,button{font:inherit;padding:10px}p{line-height:1.5}</style><h1>Отдельное пробное подключение</h1><p>Действующая пересылка остаётся включённой. Здесь будет новый личный вход. Ничего не скачивается.</p><p>Сначала — подтверждение входа на my.telegram.org и чтение своего приложения либо попытка создания нового. Telegram может отказать. Существующее приложение не меняется. Затем — отдельное подтверждение входа самой пересылки.</p><p id="status"></p><form id="form" autocomplete="off"><p id="consentRow"><label><input type="checkbox" id="consent">Это мой аккаунт. Разрешаю вход на сайт, чтение моего приложения и создание, только если его нет.</label></p><label id="label" for="value"></label><p><input id="value" type="password" autocomplete="off" maxlength="256" required></p><button id="send">Продолжить</button></form><p id="result"></p><script>
-const csrf='CSRF_VALUE';let phase='';const input=document.getElementById('value');async function tick(){try{let r=await fetch('/status',{cache:'no-store'});if(!r.ok)throw Error();let s=await r.json();phase=s.phase;document.getElementById('status').textContent=s.message;document.getElementById('form').hidden=phase==='ready';document.getElementById('consentRow').hidden=phase!=='phone';input.required=phase!=='read_app';input.hidden=phase==='read_app';document.getElementById('label').textContent=({phone:'Ваш номер Telegram',site_code:'Код входа на сайт',bridge_phone:'Тот же номер для отдельного входа пересылки',bridge_code:'Код входа пересылки',bridge_password:'Дополнительный пароль Telegram',max_token:'Ключ отдельного свободного бота MAX',read_app:'Повторить только чтение страницы приложения'})[phase]||'';}catch(e){document.getElementById('result').textContent='Соединение потеряно. Действия не отправляются.';}}
-document.getElementById('form').onsubmit=async e=>{e.preventDefault();let value=input.value;input.value='';document.getElementById('send').disabled=true;try{let r=await fetch('/action',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF':csrf},body:JSON.stringify({action:({phone:'site_phone'})[phase]||phase,value,consent:document.getElementById('consent').checked})});let s=await r.json();document.getElementById('result').textContent=s.message||'Действие принято.';}catch(e){document.getElementById('result').textContent='Ответ не получен. Не повторяйте создание: сначала обновите состояние.';}finally{value='';document.getElementById('send').disabled=false;await tick();}};tick();setInterval(tick,4000);</script></html>'''
+const csrf='CSRF_VALUE';let phase='';const input=document.getElementById('value');async function tick(){try{let r=await fetch('/status',{cache:'no-store'});if(!r.ok)throw Error();let s=await r.json();phase=s.phase;document.getElementById('status').textContent=s.message;document.getElementById('form').hidden=['ready','max_pending'].includes(phase);document.getElementById('consentRow').hidden=phase!=='phone';input.required=!['read_app','bridge_phone'].includes(phase);input.hidden=['read_app','bridge_phone'].includes(phase);document.getElementById('send').textContent=phase==='bridge_phone'?'Подтвердить вход пересылки':'Продолжить';document.getElementById('label').textContent=({phone:'Ваш номер Telegram',site_code:'Код входа на сайт',bridge_phone:'Подтвердите запрос кода входа пересылки для уже указанного аккаунта',bridge_code:'Код входа пересылки',bridge_password:'Дополнительный пароль Telegram',read_app:'Повторить только чтение страницы приложения'})[phase]||'';}catch(e){document.getElementById('result').textContent='Соединение потеряно. Действия не отправляются.';}}
+document.getElementById('form').onsubmit=async e=>{e.preventDefault();let value=input.value;input.value='';document.getElementById('send').disabled=true;try{let r=await fetch('/action',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF':csrf},body:JSON.stringify({action:({phone:'site_phone'})[phase]||phase,value,consent:phase==='bridge_phone'||document.getElementById('consent').checked})});let s=await r.json();document.getElementById('result').textContent=s.message||'Действие принято.';}catch(e){document.getElementById('result').textContent='Ответ не получен. Не повторяйте создание: сначала обновите состояние.';}finally{value='';document.getElementById('send').disabled=false;await tick();}};tick();setInterval(tick,4000);</script></html>'''
 
 
 def make_app(trial, password, port):
