@@ -517,7 +517,23 @@ def make_app(trial, password, port):
         return web.Response(text=HTML.replace('CSRF_VALUE', csrf), content_type='text/html')
 
     async def status(request):
-        return web.json_response({'phase': trial.phase, 'message': trial.message, 'qr_version': trial.qr_version, 'password_pending': trial.password_pending, 'qr_ready': trial.qr_png is not None and time.time() < trial.qr_expires})
+        phase, message = trial.phase, trial.message
+        forwarding = trial.root / 'forwarding-status.json'
+        if phase == 'max_pending' and forwarding.exists():
+            try:
+                state = json.loads(forwarding.read_text())
+                live = (state.get('active') is True and state.get('max_send_read_verified') is True
+                        and time.time() < state.get('expires', 0)
+                        and time.time() - state.get('last_read_ok', 0) < 20)
+                if live:
+                    message = 'MAX подключён для закрытой проверки. Отправка и чтение служебного сообщения подтверждены. Ждём новое сообщение между согласованными аккаунтами владельца, затем настоящий ответ в MAX. Группы пока не проверены.'
+                    if state.get('forward_observed') and state.get('reverse_observed'):
+                        message = 'В личной переписке подтверждены доставка в MAX и ответ обратно в Telegram. Группы пока не проверены.'
+                else:
+                    message = 'Telegram подключён. Закрытая проверка пересылки сейчас не подтверждена как работающая. Повторный вход не нужен; помощник проверяет состояние.'
+            except (OSError, ValueError, TypeError):
+                trial.record_failure('read_failure', ValueError())
+        return web.json_response({'phase': phase, 'message': message, 'qr_version': trial.qr_version, 'password_pending': trial.password_pending, 'qr_ready': trial.qr_png is not None and time.time() < trial.qr_expires})
 
     async def action(request):
         try:

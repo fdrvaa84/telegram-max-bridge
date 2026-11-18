@@ -70,13 +70,16 @@ class ObservedTelegram:
 
     async def __call__(self, request):
         result = await self.client(request)
-        for update in getattr(result, 'updates', []):
-            message = getattr(update, 'message', None)
-            if not isinstance(message, types.Message):
-                continue
+        messages = [update.message for update in getattr(result, 'updates', [])
+                    if isinstance(getattr(update, 'message', None), types.Message)]
+        if isinstance(result, types.UpdateShortSentMessage):
+            messages.append(result)
+        if not messages:
+            raise ValueError('telegram_send_receipt_missing')
+        for message in messages:
             actual = await self.client.get_messages(request.peer, ids=message.id)
             if (not actual or actual.reply_to_msg_id != request.reply_to.reply_to_msg_id
-                    or actual.message != message.message):
+                    or actual.message != getattr(message, 'message', request.message)):
                 raise ValueError('telegram_receipt_not_verified')
             expected_topic = getattr(request.reply_to, 'top_msg_id', None)
             actual_topic = getattr(actual.reply_to, 'reply_to_top_id', None)
@@ -165,6 +168,20 @@ async def run(root, login_root, minutes):
                     raise
             if not store.get('max_probe_observed'):
                 raise ValueError('probe_requires_reconciliation')
+            if approval.get('send_owner_instruction') and not store.get('owner_instruction_started'):
+                store.set('owner_instruction_started', True)
+                peer = approval['instruction_peer']
+                if peer not in config['allowed_peers'] or peer not in approval['owned_human_accounts']:
+                    raise ValueError('instruction_peer_not_approved')
+                try:
+                    message = await client.send_message(peer, 'ПРОБА\nПроверка пересылки Telegram → MAX. Ответьте здесь любым новым сообщением. Его копия должна появиться в MAX с пометкой «ПРОБА»; затем ответьте в MAX именно на эту копию.')
+                    observed = await client.get_messages(peer, ids=message.id)
+                    if not observed or observed.message != message.message:
+                        raise ValueError('instruction_not_observed')
+                    store.set('owner_instruction_observed', {'peer': peer, 'message': message.id})
+                except BaseException:
+                    store.set('owner_instruction_uncertain', True)
+                    raise
             failures = 0
             while not stop.is_set() and time.time() < expires and not (root / 'stop').exists():
                 try:
@@ -181,6 +198,7 @@ async def run(root, login_root, minutes):
                                 continue
                             store.add('max:' + payload['source_mid'], 'telegram', payload)
                     failures = 0
+                    store.set('read_error', None)
                     for row in store.db.execute("SELECT * FROM jobs WHERE state='pending' AND direction IN ('max','telegram') AND retry_at<=? ORDER BY rowid LIMIT 10", (time.time(),)).fetchall():
                         payload = json.loads(row['payload'])
                         if payload['chat'] not in config['allowed_peers']:
