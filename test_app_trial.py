@@ -17,6 +17,29 @@ CREATE = '<form id="app_create_form" action="/apps/create"><input name="hash" va
 
 
 class TrialTests(unittest.IsolatedAsyncioTestCase):
+    async def test_forwarding_status_requires_live_worker_and_both_directions(self):
+        self.t.phase = 'max_pending'
+        client = TestClient(TestServer(make_app(self.t, 'private-password', 18789)))
+        await client.start_server()
+        auth = {'Host': '127.0.0.1:18789', 'Authorization': 'Basic ' + base64.b64encode(b'owner:private-password').decode()}
+        state = {'active': True, 'max_send_read_verified': True, 'expires': time.time() + 100,
+                 'last_read_ok': time.time(), 'forward_observed': 0, 'reverse_observed': 0}
+        try:
+            path = self.root / 'forwarding-status.json'
+            path.write_text(json.dumps(state))
+            result = await (await client.get('/status', headers=auth)).json()
+            self.assertIn('Ждём новое сообщение', result['message'])
+            state.update(forward_observed=1, reverse_observed=1)
+            path.write_text(json.dumps(state))
+            result = await (await client.get('/status', headers=auth)).json()
+            self.assertIn('подтверждены доставка', result['message'])
+            state['last_read_ok'] = time.time() - 60
+            path.write_text(json.dumps(state))
+            result = await (await client.get('/status', headers=auth)).json()
+            self.assertIn('сейчас не подтверждена', result['message'])
+        finally:
+            await client.close()
+
     async def asyncSetUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
