@@ -12,8 +12,12 @@ from urllib.parse import urlencode
 import aiohttp
 from telethon import events, types
 
-from app_trial import LoginOnlyClient, private_write
-from bridge import Bridge, Store, reply_input, ssl_context
+from app_trial import LoginOnlyClient
+from bridge import Bridge, Store, atomic, reply_input, ssl_context
+
+
+def write_status(path, value):
+    atomic(path, json.dumps(value).encode())
 
 
 def fresh(message, activated):
@@ -130,7 +134,7 @@ async def run(root, login_root, minutes):
             if bot.get('user_id') != config['max_bot_id'] or not bot.get('is_bot'):
                 raise ValueError('max_bot_mismatch')
             initial = await bridge.api('GET', '/messages?' + urlencode({
-                'chat_id': config['max_chat_id'], 'from': int(config['activated'] * 1000), 'count': 100}))
+                'chat_id': config['max_chat_id'], 'to': int(config['activated'] * 1000), 'count': 100}))
             if not isinstance(initial.get('messages'), list):
                 raise ValueError('max_read_not_confirmed')
 
@@ -165,7 +169,7 @@ async def run(root, login_root, minutes):
             while not stop.is_set() and time.time() < expires and not (root / 'stop').exists():
                 try:
                     result = await bridge.api('GET', '/messages?' + urlencode({
-                        'chat_id': config['max_chat_id'], 'from': int(config['activated'] * 1000), 'count': 100}))
+                        'chat_id': config['max_chat_id'], 'to': int(config['activated'] * 1000), 'count': 100}))
                     messages = result.get('messages')
                     if not isinstance(messages, list) or len(messages) >= 100:
                         raise ValueError('bounded_read_incomplete')
@@ -205,7 +209,7 @@ async def run(root, login_root, minutes):
                     store.set('read_error', type(error).__name__)
                     if failures >= 3:
                         stop.set()
-                private_write(root / 'status.json', {
+                write_status(root / 'status.json', {
                     'active': not stop.is_set(), 'activated': config['activated'], 'expires': expires,
                     'max_send_read_verified': store.get('max_probe_observed', False),
                     'forward_observed': len(store.get('max_observed', [])),
@@ -222,7 +226,7 @@ async def run(root, login_root, minutes):
         if status_path.exists():
             status = json.loads(status_path.read_text())
             status['active'] = False
-            private_write(status_path, status)
+            write_status(status_path, status)
         await client.disconnect()
         store.close()
 

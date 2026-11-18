@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from bridge import Store
-from narrow_trial import TrialBridge, allowed_reply, fresh
+from narrow_trial import TrialBridge, allowed_reply, write_status
 
 
 class NarrowTrialTests(unittest.IsolatedAsyncioTestCase):
@@ -64,6 +64,12 @@ class NarrowTrialTests(unittest.IsolatedAsyncioTestCase):
         self.store.close()
         self.store = Store(Path(self.tmp.name))
         self.assertEqual(self.store.db.execute("SELECT state FROM jobs WHERE k='ambiguous'").fetchone()[0], 'uncertain')
+
+    async def test_status_replaces_existing_file(self):
+        path = Path(self.tmp.name) / 'status.json'
+        write_status(path, {'active': True})
+        write_status(path, {'active': False})
+        self.assertFalse(json.loads(path.read_text())['active'])
 
 
 if __name__ == '__main__':
