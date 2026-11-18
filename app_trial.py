@@ -9,6 +9,7 @@ Run in a dedicated private state directory, never a production project directory
 import argparse
 import asyncio
 import base64
+from datetime import datetime, timezone
 import hmac
 import io
 import qrcode
@@ -123,10 +124,36 @@ class Trial:
             self.keys = json.loads(keyfile.read_text())
             self.phone = self.keys['owner_phone']
             self.phase = 'bridge_phone'
-            self.message = 'Настройки приложения сохранены. Войдите через квадратный код: новый код сообщения не нужен. Способ доставки прежнего кода не сохранён.'
+            self.message = 'Приложение Telegram уже сохранено: создавать его и входить на my.telegram.org заново не нужно. Нажмите «Войти через квадратный код». Может потребоваться дополнительный пароль Telegram.'
             if self.proof.get('personal_login') is True:
                 self.phase = 'max_pending'
                 self.message = 'Telegram подключён. Помощник готовит подключение MAX.'
+
+    def record_failure(self, kind, exc):
+        # Never accept request values, exception messages or tracebacks here.
+        kind = kind if kind in {'read_failure', 'action_failure', 'password_failure', 'qr_failure'} else 'read_failure'
+        phase = self.phase if self.phase in {'phone', 'site_code', 'read_app', 'bridge_phone', 'bridge_code', 'bridge_qr', 'bridge_password', 'max_pending', 'ready'} else 'unknown'
+        name = type(exc).__name__
+        if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]{0,95}', name):
+            name = 'Exception'
+        row = json.dumps({'utc': datetime.now(timezone.utc).isoformat(),
+                          'kind': kind, 'phase': phase, 'exception_class': name}) + '\n'
+        try:
+            path = self.root / 'failure-journal.jsonl'
+            fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, 'r+', encoding='utf-8') as stream:
+                os.fchmod(stream.fileno(), 0o600)
+                stream.seek(0, os.SEEK_END)
+                size = stream.tell()
+                stream.seek(max(0, size - 24000))
+                previous = stream.read()
+                if size > 24000:
+                    previous = previous.partition('\n')[2]
+                stream.seek(0)
+                stream.write(previous + row)
+                stream.truncate()
+        except Exception:
+            pass  # Diagnostics must never break the owner request.
 
     def save_proof(self, **facts):
         self.proof.update(facts)
@@ -236,7 +263,8 @@ class Trial:
         except SafeError as exc:
             self.phase = 'bridge_phone'
             self.message = str(exc)
-        except Exception:
+        except Exception as exc:
+            self.record_failure('qr_failure', exc)
             self.phase = 'bridge_phone'
             self.message = 'Связь с Telegram прервалась или вход не завершён. Можно заново открыть квадратный код.'
         finally:
@@ -377,13 +405,17 @@ class Trial:
                     raise SafeError('Соединение с Telegram отсутствует. Пароль не отправлен. Помощник должен проверить текущий вход; заново входить пока не нужно.')
                 try:
                     await self.client.sign_in(password=value)
-                except errors.PasswordHashInvalidError:
+                except errors.PasswordHashInvalidError as exc:
+                    self.record_failure('password_failure', exc)
                     raise SafeError('Telegram не принял дополнительный пароль. Проверьте его; повторной отправки не было.') from None
                 except errors.FloodWaitError as exc:
+                    self.record_failure('password_failure', exc)
                     raise SafeError(f'Telegram просит подождать {exc.seconds} сек. Пароль автоматически не отправляется.') from None
-                except (errors.AuthKeyUnregisteredError, errors.SessionRevokedError):
+                except (errors.AuthKeyUnregisteredError, errors.SessionRevokedError) as exc:
+                    self.record_failure('password_failure', exc)
                     raise SafeError('Telegram не подтвердил текущий пробный вход. Это не означает, что пароль неверен. Нужна проверка помощника; не начинайте вход заново.') from None
-                except (ConnectionError, OSError, asyncio.TimeoutError):
+                except (ConnectionError, OSError, asyncio.TimeoutError) as exc:
+                    self.record_failure('password_failure', exc)
                     raise SafeError('Ответ Telegram при проверке пароля не получен. Результат неизвестен. Не вводите пароль повторно до проверки помощником.') from None
                 await self.finish()
             else:
@@ -473,7 +505,8 @@ def make_app(trial, password, port):
             return web.Response(status=403, headers={'Cache-Control': 'no-store'})
         try:
             response = await handler(request)
-        except Exception:
+        except Exception as exc:
+            trial.record_failure('action_failure' if request.method == 'POST' else 'read_failure', exc)
             response = web.json_response({'message': 'Не удалось завершить текущий шаг. Причина пока не установлена; это не означает, что пароль неверен. Повторной отправки нет. Нужна проверка помощника.'}, status=400)
         response.headers.update({'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer',
             'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY',

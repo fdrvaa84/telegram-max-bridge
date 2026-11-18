@@ -28,6 +28,20 @@ class TrialTests(unittest.IsolatedAsyncioTestCase):
         await self.t.close()
         self.tmp.cleanup()
 
+    async def test_private_bounded_diagnostics_and_nonfatal_write(self):
+        for _ in range(250):
+            self.t.record_failure('password_failure', ConnectionError('SECRET password cookie token'))
+        path = self.root / 'failure-journal.jsonl'
+        self.assertLess(path.stat().st_size, 25000)
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        self.assertEqual(rows[-1]['exception_class'], 'ConnectionError')
+        self.assertTrue(rows[-1]['utc'].endswith('+00:00'))
+        self.assertNotIn('SECRET', path.read_text())
+        self.t.root = self.root / 'missing'
+        self.t.record_failure('action_failure', RuntimeError('SECRET'))
+        self.t.root = self.root
+
     async def test_existing_and_masked_are_read_without_create(self):
         for page in (EXISTING, MASKED):
             self.assertEqual(inspect_app(page)[0], 'existing')
@@ -131,7 +145,9 @@ class TrialTests(unittest.IsolatedAsyncioTestCase):
         self.t.client.sign_in.side_effect = errors.PasswordHashInvalidError(None)
         with self.assertRaisesRegex(SafeError, 'не принял'):
             await self.t.action('bridge_password', 'PRIVATE PASSWORD')
-        self.assertEqual(list(self.root.iterdir()), [])
+        journal = (self.root / 'failure-journal.jsonl').read_text()
+        self.assertIn('PasswordHashInvalidError', journal)
+        self.assertNotIn('PRIVATE', journal)
 
     async def test_password_transport_failure_does_not_retry_or_change_phase(self):
         self.t.phase = 'bridge_password'
@@ -228,6 +244,8 @@ class TrialTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('max_token', HTML)
         self.assertIn("input.hidden=['read_app','bridge_phone'].includes(phase)", HTML)
         self.assertIn('Подтвердить вход пересылки', HTML)
+        self.assertIn("'bridge_phone','bridge_qr'].includes(phase)", HTML)
+        self.assertIn("qrStart').hidden=!['bridge_phone','bridge_code'].includes(phase)", HTML)
 
     async def test_browser_security_and_safe_errors(self):
         app = make_app(self.t, 'private-password', 18789)
@@ -252,7 +270,23 @@ class TrialTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r.status, 403)
         self.t.action = AsyncMock(side_effect=RuntimeError('PRIVATE SECRET'))
         r = await client.post('/action', headers={**auth,'Origin':'http://127.0.0.1:18789','X-CSRF':csrf}, json={'action':'site_phone','value':'PRIVATE SECRET'})
+        self.assertEqual(r.status, 400)
         self.assertNotIn('PRIVATE SECRET', await r.text())
+        journal = self.root / 'failure-journal.jsonl'
+        row = json.loads(journal.read_text().splitlines()[-1])
+        self.assertEqual(row['exception_class'], 'RuntimeError')
+        self.assertEqual(row['kind'], 'action_failure')
+        self.assertNotIn('PRIVATE', journal.read_text())
+        self.assertNotIn(self.t.phone, journal.read_text())
+        self.t.qr_png = b'synthetic'
+        self.t.qr_expires = 'PRIVATE SECRET'
+        failed_read = await client.get('/status', headers=auth)
+        self.assertEqual(failed_read.status, 400)
+        row = json.loads(journal.read_text().splitlines()[-1])
+        self.assertEqual(row['kind'], 'read_failure')
+        self.assertEqual(row['exception_class'], 'TypeError')
+        self.assertNotIn('PRIVATE', journal.read_text())
+        self.t.qr_png = None
         r = await client.get('/status', headers=auth)
         self.assertNotIn(self.t.phone, await r.text())
 
