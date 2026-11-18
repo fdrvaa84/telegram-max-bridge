@@ -5,7 +5,7 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 from aiohttp.test_utils import TestClient, TestServer
 from app_trial import Trial, SafeError, inspect_app, make_app, HTML
@@ -116,6 +116,7 @@ class TrialTests(unittest.IsolatedAsyncioTestCase):
         self.t.phase = 'bridge_code'
         self.t.deadline = time.monotonic() + 60
         self.t.client = AsyncMock()
+        self.t.client.is_connected = Mock(return_value=True)
         self.t.client.sign_in.side_effect = errors.PhoneCodeInvalidError(None)
         with self.assertRaisesRegex(SafeError, 'неверен'):
             await self.t.action('bridge_code', 'PRIVATE CODE')
@@ -128,14 +129,74 @@ class TrialTests(unittest.IsolatedAsyncioTestCase):
         await self.t.action('bridge_code', 'PRIVATE CODE')
         self.assertEqual(self.t.phase, 'bridge_password')
         self.t.client.sign_in.side_effect = errors.PasswordHashInvalidError(None)
-        with self.assertRaisesRegex(SafeError, 'неверен'):
+        with self.assertRaisesRegex(SafeError, 'не принял'):
             await self.t.action('bridge_password', 'PRIVATE PASSWORD')
         self.assertEqual(list(self.root.iterdir()), [])
+
+    async def test_password_transport_failure_does_not_retry_or_change_phase(self):
+        self.t.phase = 'bridge_password'
+        self.t.client = AsyncMock()
+        self.t.client.is_connected = Mock(return_value=True)
+        self.t.client.sign_in.side_effect = ConnectionError('PRIVATE SECRET')
+        with self.assertRaisesRegex(SafeError, 'Результат неизвестен'):
+            await self.t.action('bridge_password', 'SYNTHETIC')
+        self.t.client.sign_in.assert_awaited_once_with(password='SYNTHETIC')
+        self.assertEqual(self.t.phase, 'bridge_password')
+        self.assertFalse(self.t.password_pending)
+
+    async def test_password_provider_errors_are_specific_and_never_retried(self):
+        from telethon import errors
+        self.t.phase = 'bridge_password'
+        self.t.client = AsyncMock()
+        self.t.client.is_connected = Mock(return_value=True)
+        for error, message in (
+                (errors.AuthKeyUnregisteredError(None), 'не означает'),
+                (errors.FloodWaitError(None, capture=42), '42 сек.'),
+                (errors.PasswordHashInvalidError(None), 'не принял')):
+            self.t.client.sign_in.reset_mock()
+            self.t.client.sign_in.side_effect = error
+            with self.assertRaisesRegex(SafeError, message):
+                await self.t.action('bridge_password', 'SYNTHETIC')
+            self.t.client.sign_in.assert_awaited_once()
+            self.assertEqual(self.t.phase, 'bridge_password')
+            self.assertFalse(self.t.password_pending)
+
+    async def test_disconnected_password_is_not_sent(self):
+        self.t.phase = 'bridge_password'
+        self.t.client = AsyncMock()
+        self.t.client.is_connected = Mock(return_value=False)
+        with self.assertRaisesRegex(SafeError, 'Пароль не отправлен'):
+            await self.t.action('bridge_password', 'SYNTHETIC')
+        self.t.client.sign_in.assert_not_called()
+        self.t.client.connect.assert_not_called()
+
+    async def test_concurrent_password_is_rejected_without_second_attempt(self):
+        import asyncio
+        started, release = asyncio.Event(), asyncio.Event()
+        self.t.phase = 'bridge_password'
+        self.t.client = AsyncMock()
+        self.t.client.is_connected = Mock(return_value=True)
+        async def pending(**kwargs):
+            started.set()
+            await release.wait()
+            raise ConnectionError('PRIVATE')
+        self.t.client.sign_in.side_effect = pending
+        task = asyncio.create_task(self.t.action('bridge_password', 'SYNTHETIC'))
+        await started.wait()
+        try:
+            with self.assertRaisesRegex(SafeError, 'уже проверяется'):
+                await self.t.action('bridge_password', 'SYNTHETIC')
+        finally:
+            release.set()
+        with self.assertRaises(SafeError):
+            await task
+        self.assertEqual(self.t.client.sign_in.await_count, 1)
 
     async def test_bridge_reuses_owner_phone_only_after_confirmation(self):
         self.t.phase = 'bridge_phone'
         self.t.keys = {'owner_phone': self.t.phone}
         self.t.client = AsyncMock()
+        self.t.client.is_connected = Mock(return_value=True)
         self.t.client.is_user_authorized.return_value = False
         with self.assertRaises(SafeError):
             await self.t.action('bridge_phone', '')
@@ -149,6 +210,7 @@ class TrialTests(unittest.IsolatedAsyncioTestCase):
         self.t.call = AsyncMock(return_value=EXISTING)
         await self.t.obtain()
         self.t.client = AsyncMock()
+        self.t.client.is_connected = Mock(return_value=True)
         self.t.client.get_me.return_value = SimpleNamespace(phone=self.t.phone[1:])
         await self.t.finish()
         self.assertEqual(self.t.phase, 'max_pending')
@@ -202,6 +264,7 @@ class QRTests(unittest.IsolatedAsyncioTestCase):
         self.t.keys = {'owner_phone': '+19995550123', 'api_id': 12345, 'api_hash': KEY}
         self.t.phone = self.t.keys['owner_phone']
         self.t.client = AsyncMock()
+        self.t.client.is_connected = Mock(return_value=True)
         self.t.client.get_me.return_value = SimpleNamespace(phone='19995550123')
         self.t.qr_new = True
         self.t.phase = 'bridge_qr'
@@ -231,6 +294,7 @@ class QRTests(unittest.IsolatedAsyncioTestCase):
         await self.t.run_qr()
         self.assertEqual(self.t.phase, 'bridge_password')
         self.assertIsNone(self.t.qr_png)
+        self.t.client.disconnect.assert_not_called()
         await self.t.action('bridge_password', 'SYNTHETIC')
         self.assertTrue(self.t.proof['personal_login'])
 
@@ -348,7 +412,6 @@ class QRTests(unittest.IsolatedAsyncioTestCase):
     async def test_login_callback_does_not_read_updates(self):
         from app_trial import LoginOnlyClient
         from types import SimpleNamespace
-        from unittest.mock import Mock
         fake = SimpleNamespace(_mb_entity_cache=Mock())
         user = SimpleNamespace(id=123, bot=False, access_hash=456)
         await LoginOnlyClient._on_login(fake, user)

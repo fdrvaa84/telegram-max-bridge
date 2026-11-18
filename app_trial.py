@@ -107,6 +107,7 @@ class Trial:
         self.deadline = 0
         self.last_send = 0
         self.lock = asyncio.Lock()
+        self.password_pending = False
         self.keys = None
         self.created = False
         self.qr_task = None
@@ -265,6 +266,17 @@ class Trial:
         return message + ' Автоматического повторного запроса нет. Можно перейти к квадратному коду.'
 
     async def action(self, action, value, consent=False):
+        if action == 'bridge_password':
+            if self.password_pending:
+                raise SafeError('Пароль уже проверяется. Дождитесь ответа; повторно он не отправлен.')
+            self.password_pending = True
+            try:
+                return await self._action(action, value, consent)
+            finally:
+                self.password_pending = False
+        return await self._action(action, value, consent)
+
+    async def _action(self, action, value, consent=False):
         async with self.lock:
             if action in ('bridge_qr', 'stop_qr') and self.keys and self.phase in (
                     'bridge_phone', 'bridge_code', 'bridge_qr', 'bridge_password'):
@@ -359,10 +371,20 @@ class Trial:
                     raise SafeError('Код пересылки неверен. Проверьте код из последнего сообщения.') from None
                 await self.finish()
             elif action == 'bridge_password' and self.phase == 'bridge_password':
+                if not value:
+                    raise SafeError('Введите дополнительный пароль Telegram.')
+                if self.client is None or not self.client.is_connected():
+                    raise SafeError('Соединение с Telegram отсутствует. Пароль не отправлен. Помощник должен проверить текущий вход; заново входить пока не нужно.')
                 try:
                     await self.client.sign_in(password=value)
                 except errors.PasswordHashInvalidError:
-                    raise SafeError('Дополнительный пароль неверен.') from None
+                    raise SafeError('Telegram не принял дополнительный пароль. Проверьте его; повторной отправки не было.') from None
+                except errors.FloodWaitError as exc:
+                    raise SafeError(f'Telegram просит подождать {exc.seconds} сек. Пароль автоматически не отправляется.') from None
+                except (errors.AuthKeyUnregisteredError, errors.SessionRevokedError):
+                    raise SafeError('Telegram не подтвердил текущий пробный вход. Это не означает, что пароль неверен. Нужна проверка помощника; не начинайте вход заново.') from None
+                except (ConnectionError, OSError, asyncio.TimeoutError):
+                    raise SafeError('Ответ Telegram при проверке пароля не получен. Результат неизвестен. Не вводите пароль повторно до проверки помощником.') from None
                 await self.finish()
             else:
                 raise SafeError('Действие сейчас недоступно. Обновите страницу.')
@@ -426,14 +448,14 @@ class Trial:
             await self.client.disconnect()
 
 
-HTML = '''<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="referrer" content="no-referrer"><title>Пробное подключение</title><style>body{font:18px system-ui;max-width:700px;margin:40px auto;padding:16px}input,button{font:inherit;padding:10px}p{line-height:1.5}</style><h1>Отдельное пробное подключение</h1><p>Действующая пересылка остаётся включённой. Здесь будет новый личный вход. Ничего не скачивается.</p><p id="intro">Сначала — подтверждение входа на my.telegram.org и чтение своего приложения либо попытка создания нового. Telegram может отказать. Существующее приложение не меняется. Затем — отдельное подтверждение входа самой пересылки.</p><p id="status"></p><form id="form" autocomplete="off"><p id="consentRow"><label><input type="checkbox" id="consent">Это мой аккаунт. Разрешаю вход на сайт, чтение моего приложения и создание, только если его нет.</label></p><label id="label" for="value"></label><p><input id="value" type="password" autocomplete="off" maxlength="256" required></p><button id="send">Продолжить</button></form><p><button id="qrStart" hidden>Войти через квадратный код</button><button id="qrStop" hidden>Остановить ожидание</button></p><img id="qrImage" hidden width="300" height="300" alt="Квадратный код входа Telegram"><p id="result"></p><script>
-const csrf='CSRF_VALUE';let phase='', qrVersion=-1, qrObject=null;const input=document.getElementById('value');let ticking=false;async function tick(){if(ticking)return;ticking=true;try{let r=await fetch('/status',{cache:'no-store'});if(!r.ok)throw Error();let s=await r.json();phase=s.phase;document.getElementById('intro').hidden=phase.startsWith('bridge_')||phase==='max_pending';document.getElementById('status').textContent=s.message;document.getElementById('form').hidden=['ready','max_pending','bridge_phone','bridge_qr'].includes(phase);
+HTML = '''<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="referrer" content="no-referrer"><title>Пробное подключение</title><style>body{font:18px system-ui;max-width:700px;margin:40px auto;padding:16px}input,button{font:inherit;padding:10px}p{line-height:1.5}</style><h1>Отдельное пробное подключение</h1><p>Действующая пересылка остаётся включённой. Здесь будет новый личный вход. Ничего не скачивается.</p><p id="intro">Сначала — подтверждение входа на my.telegram.org и чтение своего приложения либо попытка создания нового. Telegram может отказать. Существующее приложение не меняется. Затем — отдельное подтверждение входа самой пересылки.</p><p id="status"></p><form id="form" autocomplete="off"><p id="consentRow"><label><input type="checkbox" id="consent">Это мой аккаунт. Разрешаю вход на сайт, чтение моего приложения и создание, только если его нет.</label></p><label id="label" for="value"></label><p><input id="value" type="password" autocomplete="off" maxlength="256" required></p><button id="send" type="submit">Продолжить</button></form><p><button id="qrStart" hidden>Войти через квадратный код</button><button id="qrStop" hidden>Остановить ожидание</button></p><img id="qrImage" hidden width="300" height="300" alt="Квадратный код входа Telegram"><p id="result"></p><script>
+const csrf='CSRF_VALUE';let phase='', qrVersion=-1, qrObject=null;const input=document.getElementById('value');let submitting=false;let ticking=false;async function tick(){if(ticking)return;ticking=true;try{let r=await fetch('/status',{cache:'no-store'});if(!r.ok)throw Error();let s=await r.json();phase=s.phase;document.getElementById('intro').hidden=phase.startsWith('bridge_')||phase==='max_pending';document.getElementById('status').textContent=s.password_pending?'Telegram проверяет пароль. Дождитесь ответа; повторной отправки нет.':s.message;document.getElementById('send').disabled=submitting||s.password_pending;document.getElementById('qrStop').disabled=submitting||s.password_pending;document.getElementById('form').hidden=['ready','max_pending','bridge_phone','bridge_qr'].includes(phase);
  document.getElementById('qrStart').hidden=!['bridge_phone','bridge_code'].includes(phase);
  document.getElementById('qrStop').hidden=!['bridge_qr','bridge_password'].includes(phase);
  const image=document.getElementById('qrImage');image.hidden=!s.qr_ready;
  if(s.qr_ready && qrVersion!==s.qr_version){image.hidden=true;let picture=await fetch('/qr.png',{cache:'no-store'});if(picture.ok){if(qrObject)URL.revokeObjectURL(qrObject);qrObject=URL.createObjectURL(await picture.blob());image.src=qrObject;image.hidden=false;qrVersion=s.qr_version;}}
  if(!s.qr_ready){image.removeAttribute('src');qrVersion=-1;if(qrObject){URL.revokeObjectURL(qrObject);qrObject=null;}}document.getElementById('consentRow').hidden=phase!=='phone';input.required=!['read_app','bridge_phone'].includes(phase);input.hidden=['read_app','bridge_phone'].includes(phase);document.getElementById('send').textContent=phase==='bridge_phone'?'Подтвердить вход пересылки':'Продолжить';document.getElementById('label').textContent=({phone:'Ваш номер Telegram',site_code:'Код входа на сайт',bridge_phone:'Подтвердите запрос кода входа пересылки для уже указанного аккаунта',bridge_code:'Код входа пересылки',bridge_password:'Дополнительный пароль Telegram',read_app:'Повторить только чтение страницы приложения'})[phase]||'';}catch(e){document.getElementById('result').textContent='Соединение потеряно. Действия не отправляются.';document.getElementById('qrImage').hidden=true;}finally{ticking=false;}}
-document.getElementById('form').onsubmit=async e=>{e.preventDefault();let value=input.value;input.value='';document.getElementById('send').disabled=true;try{let r=await fetch('/action',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF':csrf},body:JSON.stringify({action:({phone:'site_phone'})[phase]||phase,value,consent:phase==='bridge_phone'||document.getElementById('consent').checked})});let s=await r.json();document.getElementById('result').textContent=s.message||'Действие принято.';}catch(e){document.getElementById('result').textContent='Ответ не получен. Не повторяйте создание: сначала обновите состояние.';}finally{value='';document.getElementById('send').disabled=false;await tick();}};async function qrAction(action){document.getElementById('qrStart').disabled=true;try{let r=await fetch('/action',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF':csrf},body:JSON.stringify({action,value:''})});let s=await r.json();document.getElementById('result').textContent=s.message||'';}catch(e){document.getElementById('result').textContent='Не удалось получить ответ. Обновите страницу.';}finally{document.getElementById('qrStart').disabled=false;await tick();}}document.getElementById('qrStart').onclick=()=>qrAction('bridge_qr');document.getElementById('qrStop').onclick=()=>qrAction('stop_qr');tick();setInterval(tick,2000);</script></html>'''
+document.getElementById('form').onsubmit=async e=>{e.preventDefault();if(submitting)return;submitting=true;const submittedPhase=phase;document.getElementById('result').textContent='Проверяем. Дождитесь ответа; повторно нажимать не нужно.';let value=input.value;input.value='';document.getElementById('send').disabled=true;try{let r=await fetch('/action',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF':csrf},body:JSON.stringify({action:({phone:'site_phone'})[submittedPhase]||submittedPhase,value,consent:submittedPhase==='bridge_phone'||document.getElementById('consent').checked})});let s=await r.json();document.getElementById('result').textContent=s.message||'Действие принято.';}catch(e){document.getElementById('result').textContent='Ответ не получен. Результат неизвестен. Не повторяйте отправку; нужна проверка помощника.';}finally{value='';submitting=false;document.getElementById('send').disabled=false;await tick();}};async function qrAction(action){if(submitting)return;submitting=true;document.getElementById('qrStart').disabled=true;try{let r=await fetch('/action',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF':csrf},body:JSON.stringify({action,value:''})});let s=await r.json();document.getElementById('result').textContent=s.message||'';}catch(e){document.getElementById('result').textContent='Не удалось получить ответ. Обновите страницу.';}finally{submitting=false;document.getElementById('qrStart').disabled=false;await tick();}}document.getElementById('qrStart').onclick=()=>qrAction('bridge_qr');document.getElementById('qrStop').onclick=()=>qrAction('stop_qr');tick();setInterval(tick,2000);</script></html>'''
 
 
 def make_app(trial, password, port):
@@ -452,7 +474,7 @@ def make_app(trial, password, port):
         try:
             response = await handler(request)
         except Exception:
-            response = web.json_response({'message': 'Действие не завершено. Секретные сведения скрыты; автоматического повтора нет.'}, status=400)
+            response = web.json_response({'message': 'Не удалось завершить текущий шаг. Причина пока не установлена; это не означает, что пароль неверен. Повторной отправки нет. Нужна проверка помощника.'}, status=400)
         response.headers.update({'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer',
             'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY',
             'Content-Security-Policy': "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' blob:; frame-ancestors 'none'; form-action 'self'; base-uri 'none'"})
@@ -462,7 +484,7 @@ def make_app(trial, password, port):
         return web.Response(text=HTML.replace('CSRF_VALUE', csrf), content_type='text/html')
 
     async def status(request):
-        return web.json_response({'phase': trial.phase, 'message': trial.message, 'qr_version': trial.qr_version, 'qr_ready': trial.qr_png is not None and time.time() < trial.qr_expires})
+        return web.json_response({'phase': trial.phase, 'message': trial.message, 'qr_version': trial.qr_version, 'password_pending': trial.password_pending, 'qr_ready': trial.qr_png is not None and time.time() < trial.qr_expires})
 
     async def action(request):
         try:
