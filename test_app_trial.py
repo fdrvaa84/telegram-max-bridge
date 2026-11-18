@@ -194,6 +194,166 @@ class TrialTests(unittest.IsolatedAsyncioTestCase):
         r = await client.get('/status', headers=auth)
         self.assertNotIn(self.t.phone, await r.text())
 
+class QRTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        from types import SimpleNamespace
+        self.tmp = tempfile.TemporaryDirectory()
+        self.t = Trial(Path(self.tmp.name))
+        self.t.keys = {'owner_phone': '+19995550123', 'api_id': 12345, 'api_hash': KEY}
+        self.t.phone = self.t.keys['owner_phone']
+        self.t.client = AsyncMock()
+        self.t.client.get_me.return_value = SimpleNamespace(phone='19995550123')
+        self.t.qr_new = True
+        self.t.phase = 'bridge_qr'
+
+    async def asyncTearDown(self):
+        await self.t.close()
+        self.tmp.cleanup()
+
+    def qr(self, wait):
+        from types import SimpleNamespace
+        from datetime import datetime, timezone, timedelta
+        return SimpleNamespace(url='tg://login?token=SYNTHETIC',
+            expires=datetime.now(timezone.utc)+timedelta(seconds=30), wait=wait)
+
+    async def test_correct_owner(self):
+        client = self.t.client
+        client.qr_login.return_value = self.qr(AsyncMock())
+        await self.t.run_qr()
+        self.assertEqual(self.t.phase, 'max_pending')
+        self.assertTrue(self.t.proof['personal_login'])
+        client.log_out.assert_not_called()
+        self.assertIsNone(self.t.qr_png)
+
+    async def test_password_then_owner(self):
+        from telethon import errors
+        self.t.client.qr_login.return_value = self.qr(AsyncMock(side_effect=errors.SessionPasswordNeededError(None)))
+        await self.t.run_qr()
+        self.assertEqual(self.t.phase, 'bridge_password')
+        self.assertIsNone(self.t.qr_png)
+        await self.t.action('bridge_password', 'SYNTHETIC')
+        self.assertTrue(self.t.proof['personal_login'])
+
+    async def test_other_owner_logs_out_only_trial(self):
+        from types import SimpleNamespace
+        client = self.t.client
+        client.get_me.return_value = SimpleNamespace(phone='19995550999')
+        client.log_out.return_value = True
+        client.qr_login.return_value = self.qr(AsyncMock())
+        await self.t.run_qr()
+        self.assertEqual(self.t.phase, 'bridge_phone')
+        client.log_out.assert_awaited_once()
+        self.assertNotIn('personal_login', self.t.proof)
+        client.get_dialogs.assert_not_called()
+        client.get_messages.assert_not_called()
+
+    async def test_expired_qr_refreshes_then_network_error_stops(self):
+        client = self.t.client
+        client.qr_login.side_effect = [self.qr(AsyncMock(side_effect=TimeoutError())), OSError('PRIVATE')]
+        await self.t.run_qr()
+        self.assertEqual(client.qr_login.await_count, 2)
+        self.assertEqual(self.t.phase, 'bridge_phone')
+        self.assertIsNone(self.t.qr_png)
+        self.assertNotIn('PRIVATE', self.t.message)
+        self.assertNotIn('personal_login', self.t.proof)
+        client.send_code_request.assert_not_called()
+
+    async def test_cancel_waiter_before_switch(self):
+        import asyncio
+        started, stopped = asyncio.Event(), asyncio.Event()
+        async def wait():
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                stopped.set()
+        self.t.client.qr_login.return_value = self.qr(wait)
+        self.t.client.is_user_authorized.return_value = False
+        self.t.qr_task = asyncio.create_task(self.t.run_qr())
+        await started.wait()
+        await self.t.action('stop_qr', '')
+        self.assertTrue(stopped.is_set())
+        self.assertIsNone(self.t.qr_task)
+        self.assertIsNone(self.t.client)
+        self.assertIsNone(self.t.qr_png)
+        self.assertEqual(self.t.phase, 'bridge_phone')
+
+    async def test_missing_identity_is_error_not_absence(self):
+        self.t.client.get_me.return_value = None
+        self.t.client.qr_login.return_value = self.qr(AsyncMock())
+        await self.t.run_qr()
+        self.assertNotIn('personal_login', self.t.proof)
+        self.assertIn('не подтвердил', self.t.message)
+
+    async def test_official_delivery_types(self):
+        from telethon.tl import types
+        from types import SimpleNamespace
+        for typ, phrase in ((types.auth.SentCodeTypeApp(5), 'сообщении Telegram'),
+                            (types.auth.SentCodeTypeSms(5), 'СМС'),
+                            (types.auth.SentCodeTypeCall(5), 'голосовым звонком'),
+                            (types.auth.SentCodeTypeEmailCode('s***', 5), 'электронную почту')):
+            message = Trial.describe_delivery(SimpleNamespace(type=typ, next_type=types.auth.CodeTypeSms(), timeout=60))
+            self.assertIn(phrase, message)
+            self.assertIn('60 сек.', message)
+            self.assertIn('Следующий', message)
+            self.assertNotIn('s***', message)
+
+    async def test_image_route_protected_and_no_query(self):
+        self.t.qr_png = b'\x89PNG\r\n\x1a\nSYNTHETIC'
+        self.t.qr_expires = time.time()+30
+        client = TestClient(TestServer(make_app(self.t, 'private-password', 18789)))
+        await client.start_server()
+        self.addAsyncCleanup(client.close)
+        host = {'Host': '127.0.0.1:18789'}
+        self.assertEqual((await client.get('/qr.png', headers=host)).status, 401)
+        auth = {**host, 'Authorization': 'Basic '+base64.b64encode(b'owner:private-password').decode()}
+        response = await client.get('/qr.png', headers=auth)
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.headers['Cache-Control'], 'no-store')
+        self.assertEqual(response.content_type, 'image/png')
+        self.assertEqual((await client.get('/qr.png?token=NO', headers=auth)).status, 403)
+        self.t.qr_expires = 0
+        self.assertEqual((await client.get('/qr.png', headers=auth)).status, 404)
+        response = await client.get('/status', headers=auth)
+        self.assertNotIn('SYNTHETIC', await response.text())
+
+    async def test_qr_starts_only_after_button_and_keeps_application(self):
+        import asyncio
+        from unittest.mock import patch
+        client = self.t.client
+        self.t.client = None
+        self.t.phase = 'bridge_phone'
+        client.is_user_authorized.return_value = False
+        client.qr_login.return_value = self.qr(lambda: asyncio.Event().wait())
+        with patch('app_trial.LoginOnlyClient', return_value=client) as factory:
+            await self.t.action('bridge_qr', '')
+            await asyncio.sleep(0)
+            self.assertEqual(self.t.phase, 'bridge_qr')
+            self.assertTrue(factory.call_args.kwargs['receive_updates'])
+            client.send_code_request.assert_not_called()
+            self.assertIsNotNone(self.t.qr_task)
+            await self.t.action('stop_qr', '')
+        self.assertEqual(self.t.keys['owner_phone'], '+19995550123')
+
+    async def test_total_wait_expires_without_code_requests(self):
+        from unittest.mock import patch
+        client = self.t.client
+        with patch('app_trial.time.monotonic', side_effect=[0, 301]):
+            await self.t.run_qr()
+        self.assertEqual(self.t.phase, 'bridge_phone')
+        self.assertIn('истекло', self.t.message)
+        client.qr_login.assert_not_called()
+        client.send_code_request.assert_not_called()
+
+    async def test_login_callback_does_not_read_updates(self):
+        from app_trial import LoginOnlyClient
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        fake = SimpleNamespace(_mb_entity_cache=Mock())
+        user = SimpleNamespace(id=123, bot=False, access_hash=456)
+        await LoginOnlyClient._on_login(fake, user)
+        self.assertTrue(fake._authorized)
+
 
 if __name__ == '__main__':
     unittest.main()
